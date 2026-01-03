@@ -27,11 +27,29 @@ go get github.com/tendant/simple-workflow
 
 ### 1. Apply Migrations
 
-Apply the SQL migrations to your PostgreSQL database:
+Apply the SQL migrations to your PostgreSQL database using the Makefile:
 
 ```bash
-psql -d yourdb < migrations/001_create_workflow_intent.sql
-psql -d yourdb < migrations/002_create_workflow_registry.sql
+# Show help
+make help
+
+# Apply all migrations (with defaults: localhost, pas user, pas db)
+make migrate-up
+
+# Check migration status
+make migrate-status
+
+# Custom database credentials
+make migrate-up DB_HOST=myhost DB_USER=myuser DB_PASSWORD=mypass DB_NAME=mydb
+
+# Rollback last migration
+make migrate-down
+```
+
+Or manually with goose:
+
+```bash
+goose -dir migrations postgres "host=localhost user=pas dbname=pas password=pwd sslmode=disable search_path=workflow" up
 ```
 
 ### 2. Producer: Insert Intents
