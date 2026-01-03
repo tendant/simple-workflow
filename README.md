@@ -296,6 +296,74 @@ Creating a workflow means **recording intent**, not running code. If intent is s
 
 The same workflow may be implemented in Go today, Python tomorrow. Producers never care.
 
+## Makefile Commands
+
+The project includes a Makefile for convenient database migration management:
+
+```bash
+# Show all available commands
+make help
+
+# Database Migrations
+make migrate-up         # Apply all pending migrations
+make migrate-down       # Rollback the last migration
+make migrate-status     # Show current migration status
+make migrate-reset      # Rollback all and reapply (WARNING: destructive)
+make migrate-create NAME=my_migration  # Create a new migration file
+
+# Build and Test
+make build             # Build the library
+make test              # Run integration tests
+make clean             # Clean build artifacts
+```
+
+### Environment Variables
+
+Override database connection settings:
+
+```bash
+# Default values
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=pas
+DB_PASSWORD=pwd
+DB_NAME=pas
+DB_SSLMODE=disable
+
+# Example with custom values
+make migrate-up DB_USER=myuser DB_PASSWORD=mypass DB_NAME=production
+```
+
+### Common Workflows
+
+**Initial Setup:**
+```bash
+make migrate-up
+make migrate-status
+```
+
+**Development Iteration:**
+```bash
+# Create new migration
+make migrate-create NAME=add_new_feature
+
+# Edit the generated migration file
+# migrations/YYYYMMDDHHMMSS_add_new_feature.sql
+
+# Apply it
+make migrate-up
+```
+
+**Rollback and Retry:**
+```bash
+# Rollback last migration
+make migrate-down
+
+# Make fixes to the migration file
+# Reapply
+make migrate-up
+```
+
 ## Monitoring
 
 Query workflow status:
