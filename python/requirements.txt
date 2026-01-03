@@ -1,0 +1,4 @@
+# Simple-Workflow Python Library Dependencies
+
+# PostgreSQL driver
+psycopg2-binary>=2.9.0

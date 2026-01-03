@@ -19,8 +19,19 @@ A generic, durable intent system for asynchronous work in Go.
 
 ## Installation
 
+### Go
+
 ```bash
 go get github.com/tendant/simple-workflow
+```
+
+### Python
+
+```bash
+cd python
+pip install -r requirements.txt
+# Or install as package
+pip install -e .
 ```
 
 ## Quick Start
@@ -144,6 +155,45 @@ func main() {
     poller.Start(context.Background())
 }
 ```
+
+### 4. Python Worker (Alternative)
+
+Python workers use the same `workflow_intent` table:
+
+```python
+#!/usr/bin/env python3
+from simpleworkflow import IntentPoller, WorkflowExecutor
+
+class ThumbnailExecutor(WorkflowExecutor):
+    def execute(self, intent):
+        payload = intent['payload']
+        content_id = payload['content_id']
+        width = payload['width']
+        height = payload['height']
+
+        # Execute workflow logic
+        print(f"Generating thumbnail for {content_id} ({width}x{height})")
+
+        return {"status": "completed"}
+
+# Database URL (must include search_path=workflow)
+db_url = "postgres://user:pass@localhost/db?search_path=workflow"
+
+# Create and configure poller
+poller = IntentPoller(
+    db_url=db_url,
+    supported_workflows=["content.thumbnail.v1"],
+    worker_id="thumbnail-worker-python"
+)
+
+# Register executor
+poller.register_executor("content.thumbnail.v1", ThumbnailExecutor())
+
+# Start polling
+poller.start()
+```
+
+See `python/README.md` for complete Python documentation.
 
 ## Architecture
 
