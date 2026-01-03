@@ -33,13 +33,17 @@ Apply the SQL migrations to your PostgreSQL database using the Makefile:
 # Show help
 make help
 
-# Apply all migrations (with defaults: localhost, pas user, pas db)
+# Configure database credentials (recommended)
+cp .env.example .env
+# Edit .env with your database credentials
+
+# Apply all migrations (uses .env or defaults: localhost, postgres user, workflow db)
 make migrate-up
 
 # Check migration status
 make migrate-status
 
-# Custom database credentials
+# Override .env with command line arguments
 make migrate-up DB_HOST=myhost DB_USER=myuser DB_PASSWORD=mypass DB_NAME=mydb
 
 # Rollback last migration
@@ -49,7 +53,7 @@ make migrate-down
 Or manually with goose:
 
 ```bash
-goose -dir migrations postgres "host=localhost user=pas dbname=pas password=pwd sslmode=disable search_path=workflow" up
+goose -dir migrations postgres "host=localhost user=postgres dbname=workflow password=postgres sslmode=disable search_path=workflow" up
 ```
 
 ### 2. Producer: Insert Intents
@@ -325,9 +329,9 @@ Override database connection settings:
 # Default values
 DB_HOST=localhost
 DB_PORT=5432
-DB_USER=pas
-DB_PASSWORD=pwd
-DB_NAME=pas
+DB_USER=postgres
+DB_PASSWORD=postgres
+DB_NAME=workflow
 DB_SSLMODE=disable
 
 # Example with custom values

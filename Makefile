@@ -1,11 +1,17 @@
 .PHONY: help migrate-up migrate-down migrate-status migrate-reset test build clean
 
-# Database configuration
+# Load .env file if it exists
+ifneq (,$(wildcard .env))
+    include .env
+    export
+endif
+
+# Database configuration (defaults, can be overridden by .env or command line)
 DB_HOST ?= localhost
 DB_PORT ?= 5432
-DB_USER ?= pas
-DB_PASSWORD ?= pwd
-DB_NAME ?= pas
+DB_USER ?= postgres
+DB_PASSWORD ?= postgres
+DB_NAME ?= workflow
 DB_SSLMODE ?= disable
 
 # Goose configuration
@@ -32,13 +38,20 @@ help:
 	@echo "Environment Variables:"
 	@echo "  DB_HOST              - Database host (default: localhost)"
 	@echo "  DB_PORT              - Database port (default: 5432)"
-	@echo "  DB_USER              - Database user (default: pas)"
-	@echo "  DB_PASSWORD          - Database password (default: pwd)"
-	@echo "  DB_NAME              - Database name (default: pas)"
+	@echo "  DB_USER              - Database user (default: postgres)"
+	@echo "  DB_PASSWORD          - Database password (default: postgres)"
+	@echo "  DB_NAME              - Database name (default: workflow)"
 	@echo "  DB_SSLMODE           - SSL mode (default: disable)"
 	@echo ""
+	@echo "Configuration:"
+	@echo "  1. Copy .env.example to .env and edit (recommended)"
+	@echo "  2. Set environment variables in shell"
+	@echo "  3. Pass variables on command line"
+	@echo ""
 	@echo "Example:"
-	@echo "  make migrate-up DB_USER=myuser DB_PASSWORD=mypass"
+	@echo "  cp .env.example .env  # Edit .env with your credentials"
+	@echo "  make migrate-up       # Uses .env"
+	@echo "  make migrate-up DB_USER=myuser DB_PASSWORD=mypass  # Override .env"
 
 migrate-up:
 	@echo "Applying migrations..."

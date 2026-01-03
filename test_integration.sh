@@ -8,11 +8,20 @@ echo "Simple-Workflow Integration Test"
 echo "=================================================="
 echo ""
 
-# Database connection
-export PGPASSWORD=pwd
-DB_HOST="localhost"
-DB_USER="pas"
-DB_NAME="pas"
+# Load .env if it exists
+if [ -f .env ]; then
+    echo "Loading configuration from .env..."
+    export $(cat .env | grep -v '^#' | xargs)
+fi
+
+# Database connection (use env vars or defaults)
+DB_HOST="${DB_HOST:-localhost}"
+DB_PORT="${DB_PORT:-5432}"
+DB_USER="${DB_USER:-postgres}"
+DB_PASSWORD="${DB_PASSWORD:-postgres}"
+DB_NAME="${DB_NAME:-workflow}"
+
+export PGPASSWORD="$DB_PASSWORD"
 
 # Colors
 GREEN='\033[0;32m'
