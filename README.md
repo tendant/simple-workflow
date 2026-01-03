@@ -150,7 +150,7 @@ func main() {
 ```
 ┌─────────────┐
 │  Producer   │  Inserts intents
-│  (PAS API)  │  - Never calls workers
+│ (Your API)  │  - Never calls workers
 └──────┬──────┘  - Never depends on worker availability
        │
        │ INSERT intent
