@@ -43,11 +43,11 @@ func (c *Client) Create(ctx context.Context, intent Intent) (string, error) {
 
 	query := `
 		INSERT INTO workflow_intent (
-			intent_id, name, payload, priority, run_after,
+			id, name, payload, priority, run_after,
 			idempotency_key, max_attempts
 		) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (idempotency_key) DO NOTHING
-		RETURNING intent_id
+		RETURNING id
 	`
 
 	var returnedID string

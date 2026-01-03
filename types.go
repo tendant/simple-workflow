@@ -17,7 +17,7 @@ type Intent struct {
 
 // WorkflowIntent represents a claimed intent from the database
 type WorkflowIntent struct {
-	IntentID     string
+	ID           string
 	Name         string
 	Payload      []byte // JSON
 	AttemptCount int

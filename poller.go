@@ -84,7 +84,7 @@ func (p *Poller) pollAndExecute(ctx context.Context) {
 		return
 	}
 
-	log.Printf("Claimed intent: %s (name: %s)", intent.IntentID, intent.Name)
+	log.Printf("Claimed intent: %s (name: %s)", intent.ID, intent.Name)
 
 	// Execute the workflow
 	p.executeIntent(ctx, intent)
@@ -99,11 +99,12 @@ func (p *Poller) claimIntent(ctx context.Context) (*WorkflowIntent, error) {
 
 	// Claim using SELECT FOR UPDATE SKIP LOCKED
 	query := `
-		SELECT intent_id, name, payload, attempt_count, max_attempts
+		SELECT id, name, payload, attempt_count, max_attempts
 		FROM workflow_intent
 		WHERE status = 'pending'
 		  AND name = ANY($1)
 		  AND run_after <= NOW()
+		  AND deleted_at IS NULL
 		ORDER BY priority ASC, created_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
@@ -111,7 +112,7 @@ func (p *Poller) claimIntent(ctx context.Context) (*WorkflowIntent, error) {
 
 	var intent WorkflowIntent
 	err = tx.QueryRowContext(ctx, query, pq.Array(p.supportedWorkflows)).Scan(
-		&intent.IntentID, &intent.Name, &intent.Payload,
+		&intent.ID, &intent.Name, &intent.Payload,
 		&intent.AttemptCount, &intent.MaxAttempts,
 	)
 	if err == sql.ErrNoRows {
@@ -128,9 +129,9 @@ func (p *Poller) claimIntent(ctx context.Context) (*WorkflowIntent, error) {
 			claimed_by = $1,
 			lease_expires_at = NOW() + INTERVAL '5 minutes',
 			updated_at = NOW()
-		WHERE intent_id = $2
+		WHERE id = $2
 	`
-	_, err = tx.ExecContext(ctx, updateQuery, p.workerID, intent.IntentID)
+	_, err = tx.ExecContext(ctx, updateQuery, p.workerID, intent.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -170,13 +171,13 @@ func (p *Poller) markIntentSucceeded(ctx context.Context, intent *WorkflowIntent
 		SET status = 'succeeded',
 			result = $1,
 			updated_at = NOW()
-		WHERE intent_id = $2
+		WHERE id = $2
 	`
-	_, err := p.db.ExecContext(ctx, query, resultJSON, intent.IntentID)
+	_, err := p.db.ExecContext(ctx, query, resultJSON, intent.ID)
 	if err != nil {
-		log.Printf("Failed to mark intent %s as succeeded: %v", intent.IntentID, err)
+		log.Printf("Failed to mark intent %s as succeeded: %v", intent.ID, err)
 	} else {
-		log.Printf("Intent %s succeeded", intent.IntentID)
+		log.Printf("Intent %s succeeded", intent.ID)
 	}
 }
 
@@ -196,12 +197,12 @@ func (p *Poller) markIntentFailed(ctx context.Context, intent *WorkflowIntent, e
 			run_after = $3,
 			last_error = $4,
 			updated_at = NOW()
-		WHERE intent_id = $5
+		WHERE id = $5
 	`
-	_, err := p.db.ExecContext(ctx, query, status, newAttemptCount, runAfter, execErr.Error(), intent.IntentID)
+	_, err := p.db.ExecContext(ctx, query, status, newAttemptCount, runAfter, execErr.Error(), intent.ID)
 	if err != nil {
-		log.Printf("Failed to mark intent %s as failed: %v", intent.IntentID, err)
+		log.Printf("Failed to mark intent %s as failed: %v", intent.ID, err)
 	} else {
-		log.Printf("Intent %s failed (attempt %d/%d): %v", intent.IntentID, newAttemptCount, intent.MaxAttempts, execErr)
+		log.Printf("Intent %s failed (attempt %d/%d): %v", intent.ID, newAttemptCount, intent.MaxAttempts, execErr)
 	}
 }
