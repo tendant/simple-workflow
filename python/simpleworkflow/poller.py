@@ -342,6 +342,13 @@ class IntentPoller:
                 if self.metrics:
                     try:
                         duration = time.time() - execution_start
+
+                        # Record failed attempt
+                        self.metrics.record_failed_attempt(
+                            workflow_name, self.worker_id, new_attempt_count
+                        )
+
+                        # Record completion status
                         self.metrics.record_intent_completed(
                             workflow_name, self.worker_id, status, duration
                         )

@@ -81,13 +81,9 @@ func (p *Poller) Stop() {
 }
 
 func (p *Poller) pollAndExecute(ctx context.Context) {
-	// Record poll cycle and update worker metrics
+	// Record poll cycle (automatically updates uptime and last poll timestamp)
 	if p.metrics != nil {
 		p.metrics.RecordPollCycle(p.workerID)
-		if !p.startTime.IsZero() {
-			p.metrics.UpdateWorkerUptime(p.workerID, time.Since(p.startTime).Seconds())
-			p.metrics.UpdateLastPollTimestamp(p.workerID, float64(time.Now().Unix()))
-		}
 	}
 
 	executionStart := time.Now()
@@ -245,6 +241,11 @@ func (p *Poller) markIntentFailed(ctx context.Context, intent *WorkflowIntent, e
 	// Record metrics
 	if p.metrics != nil {
 		duration := time.Since(executionStart)
+
+		// Record failed attempt
+		p.metrics.RecordFailedAttempt(intent.Name, p.workerID, newAttemptCount)
+
+		// Record completion status
 		p.metrics.RecordIntentCompleted(intent.Name, p.workerID, status, duration)
 
 		// Record deadletter metric if workflow permanently failed
@@ -269,7 +270,30 @@ func (p *Poller) updateQueueDepth(ctx context.Context) {
 		).Scan(&depth)
 
 		if err == nil {
-			p.metrics.RecordQueueDepth(workflowName, depth)
+			p.metrics.RecordQueueDepth(workflowName, "pending", depth)
 		}
+	}
+}
+
+// classifyError categorizes errors for metrics tracking
+func classifyError(err error) string {
+	if err == nil {
+		return "none"
+	}
+	switch err {
+	case sql.ErrNoRows:
+		return "no_rows"
+	case sql.ErrTxDone:
+		return "tx_done"
+	case context.DeadlineExceeded:
+		return "timeout"
+	case context.Canceled:
+		return "canceled"
+	default:
+		// Check for database errors
+		if err.Error() == "database is closed" {
+			return "db_closed"
+		}
+		return "unknown"
 	}
 }

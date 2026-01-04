@@ -27,6 +27,11 @@ class MetricsCollector(ABC):
         pass
 
     @abstractmethod
+    def record_failed_attempt(self, workflow_name: str, worker_id: str, attempt_number: int):
+        """Record individual workflow execution failures before deadletter"""
+        pass
+
+    @abstractmethod
     def record_poll_cycle(self, worker_id: str):
         """Record a completed poll cycle"""
         pass
@@ -73,6 +78,12 @@ class PrometheusMetrics(MetricsCollector):
             "workflow_intent_deadletter_total",
             "Total workflow intents moved to deadletter",
             ["workflow_name", "worker_id"],
+        )
+
+        self.intent_failed_attempts = Counter(
+            "workflow_intent_failed_attempts_total",
+            "Total failed workflow attempts before deadletter",
+            ["workflow_name", "worker_id", "attempt"],
         )
 
         self.intent_execution_duration = Histogram(
@@ -136,8 +147,27 @@ class PrometheusMetrics(MetricsCollector):
             workflow_name=workflow_name, worker_id=worker_id
         ).inc()
 
+    def record_failed_attempt(self, workflow_name: str, worker_id: str, attempt_number: int):
+        """Record individual failure attempts"""
+        if attempt_number == 1:
+            attempt_label = "1"
+        elif attempt_number == 2:
+            attempt_label = "2"
+        else:
+            attempt_label = "3+"
+
+        self.intent_failed_attempts.labels(
+            workflow_name=workflow_name,
+            worker_id=worker_id,
+            attempt=attempt_label
+        ).inc()
+
     def record_poll_cycle(self, worker_id: str):
+        """Record poll cycle and automatically update worker health gauges"""
         self.poll_cycle_total.labels(worker_id=worker_id).inc()
+        self.worker_last_poll.labels(worker_id=worker_id).set(time.time())
+        uptime = time.time() - self.start_time
+        self.worker_uptime.labels(worker_id=worker_id).set(uptime)
 
     def record_poll_error(self, worker_id: str, error_type: str):
         self.poll_errors_total.labels(worker_id=worker_id, error_type=error_type).inc()
