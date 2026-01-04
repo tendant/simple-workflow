@@ -88,6 +88,12 @@ class IntentPoller:
         self.metrics = metrics
         self.start_time = time.time()
 
+        # Debug: Log metrics initialization
+        if self.metrics:
+            logger.info(f"DEBUG: Metrics collector initialized: {type(self.metrics).__name__}")
+        else:
+            logger.warning("Metrics collector is None - metrics will not be recorded")
+
     def register_executor(self, workflow_name: str, executor: WorkflowExecutor):
         """
         Register a workflow executor for a specific workflow name.
@@ -133,10 +139,13 @@ class IntentPoller:
         """Poll for work and execute if found"""
         # Record poll cycle and update worker metrics
         if self.metrics:
-            self.metrics.record_poll_cycle(self.worker_id)
-            uptime = time.time() - self.start_time
-            self.metrics.update_worker_uptime(self.worker_id, uptime)
-            self.metrics.update_last_poll_timestamp(self.worker_id, time.time())
+            try:
+                self.metrics.record_poll_cycle(self.worker_id)
+                uptime = time.time() - self.start_time
+                self.metrics.update_worker_uptime(self.worker_id, uptime)
+                self.metrics.update_last_poll_timestamp(self.worker_id, time.time())
+            except Exception as e:
+                logger.error(f"Error recording poll metrics: {e}", exc_info=True)
 
         execution_start = time.time()
 
@@ -144,21 +153,30 @@ class IntentPoller:
             intent = self.claim_intent()
         except Exception as e:
             if self.metrics:
-                error_type = type(e).__name__
-                self.metrics.record_poll_error(self.worker_id, error_type)
+                try:
+                    error_type = type(e).__name__
+                    self.metrics.record_poll_error(self.worker_id, error_type)
+                except Exception as me:
+                    logger.error(f"Error recording poll error metric: {me}", exc_info=True)
             raise
 
         if intent is None:
             # No work available - update queue depth metrics
             if self.metrics:
-                self._update_queue_depth()
+                try:
+                    self._update_queue_depth()
+                except Exception as e:
+                    logger.error(f"Error updating queue depth: {e}", exc_info=True)
             return
 
         # Record intent claimed
-        if self.metrics:
-            self.metrics.record_intent_claimed(intent["name"], self.worker_id)
-
         logger.info(f"Claimed intent: {intent['id']} (name: {intent['name']})")
+        if self.metrics:
+            try:
+                self.metrics.record_intent_claimed(intent["name"], self.worker_id)
+                logger.info(f"DEBUG: Recorded intent_claimed metric for {intent['name']}")
+            except Exception as e:
+                logger.error(f"Error recording intent_claimed metric: {e}", exc_info=True)
 
         try:
             result = self.execute_intent(intent)
@@ -264,10 +282,14 @@ class IntentPoller:
 
                 # Record metrics
                 if self.metrics:
-                    duration = time.time() - execution_start
-                    self.metrics.record_intent_completed(
-                        workflow_name, self.worker_id, "succeeded", duration
-                    )
+                    try:
+                        duration = time.time() - execution_start
+                        self.metrics.record_intent_completed(
+                            workflow_name, self.worker_id, "succeeded", duration
+                        )
+                        logger.info(f"DEBUG: Recorded intent_completed metric (succeeded) for {workflow_name}, duration={duration:.3f}s")
+                    except Exception as e:
+                        logger.error(f"Error recording intent_completed metric: {e}", exc_info=True)
         except Exception as e:
             logger.error(
                 f"Error marking intent {intent_id} as succeeded: {e}", exc_info=True
@@ -318,16 +340,21 @@ class IntentPoller:
 
                 # Record metrics
                 if self.metrics:
-                    duration = time.time() - execution_start
-                    self.metrics.record_intent_completed(
-                        workflow_name, self.worker_id, status, duration
-                    )
-
-                    # Record deadletter metric if workflow permanently failed
-                    if status == "deadletter":
-                        self.metrics.record_intent_deadletter(
-                            workflow_name, self.worker_id
+                    try:
+                        duration = time.time() - execution_start
+                        self.metrics.record_intent_completed(
+                            workflow_name, self.worker_id, status, duration
                         )
+                        logger.info(f"DEBUG: Recorded intent_completed metric ({status}) for {workflow_name}, duration={duration:.3f}s")
+
+                        # Record deadletter metric if workflow permanently failed
+                        if status == "deadletter":
+                            self.metrics.record_intent_deadletter(
+                                workflow_name, self.worker_id
+                            )
+                            logger.info(f"DEBUG: Recorded intent_deadletter metric for {workflow_name}")
+                    except Exception as e:
+                        logger.error(f"Error recording metrics in mark_failed: {e}", exc_info=True)
         except Exception as e:
             logger.error(
                 f"Error marking intent {intent_id} as failed: {e}", exc_info=True
