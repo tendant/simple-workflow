@@ -9,8 +9,11 @@ import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Callable
+from urllib.parse import urlparse, parse_qs, urlunparse
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+from .metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
 
@@ -47,22 +50,43 @@ class IntentPoller:
         supported_workflows: list[str],
         worker_id: str = "python-worker",
         poll_interval: int = 2,
+        metrics: Optional[MetricsCollector] = None,
     ):
         """
         Initialize the intent poller.
 
         Args:
-            db_url: PostgreSQL connection string (must include search_path=workflow)
+            db_url: PostgreSQL connection string (may include search_path= query parameter)
             supported_workflows: List of workflow names this poller handles
             worker_id: Unique identifier for this worker (default: "python-worker")
             poll_interval: Polling interval in seconds (default: 2)
+            metrics: Optional metrics collector for observability
         """
-        self.db_url = db_url
+        # Parse URL to extract and remove search_path (psycopg2 doesn't support it as query param)
+        parsed = urlparse(db_url)
+        if parsed.query:
+            query_params = parse_qs(parsed.query)
+            self.search_path = query_params.get('search_path', ['public'])[0]
+            # Remove search_path from query params
+            filtered_params = {k: v for k, v in query_params.items() if k != 'search_path'}
+            # Rebuild query string
+            new_query = '&'.join(f"{k}={v[0]}" for k, v in filtered_params.items())
+            # Rebuild URL
+            self.db_url = urlunparse((
+                parsed.scheme, parsed.netloc, parsed.path,
+                parsed.params, new_query, parsed.fragment
+            ))
+        else:
+            self.db_url = db_url
+            self.search_path = 'public'
+
         self.supported_workflows = supported_workflows
         self.worker_id = worker_id
         self.poll_interval = poll_interval
         self.running = False
         self.executors: Dict[str, WorkflowExecutor] = {}
+        self.metrics = metrics
+        self.start_time = time.time()
 
     def register_executor(self, workflow_name: str, executor: WorkflowExecutor):
         """
@@ -74,6 +98,15 @@ class IntentPoller:
         """
         self.executors[workflow_name] = executor
         logger.info(f"Registered executor for workflow: {workflow_name}")
+
+    def _connect(self):
+        """Create a database connection and set search_path"""
+        conn = psycopg2.connect(self.db_url)
+        if self.search_path:
+            with conn.cursor() as cur:
+                cur.execute(f"SET search_path TO {self.search_path}")
+                conn.commit()
+        return conn
 
     def start(self):
         """Start polling loop (blocking)"""
@@ -98,26 +131,54 @@ class IntentPoller:
 
     def poll_and_execute(self):
         """Poll for work and execute if found"""
-        intent = self.claim_intent()
+        # Record poll cycle and update worker metrics
+        if self.metrics:
+            self.metrics.record_poll_cycle(self.worker_id)
+            uptime = time.time() - self.start_time
+            self.metrics.update_worker_uptime(self.worker_id, uptime)
+            self.metrics.update_last_poll_timestamp(self.worker_id, time.time())
+
+        execution_start = time.time()
+
+        try:
+            intent = self.claim_intent()
+        except Exception as e:
+            if self.metrics:
+                error_type = type(e).__name__
+                self.metrics.record_poll_error(self.worker_id, error_type)
+            raise
+
         if intent is None:
+            # No work available - update queue depth metrics
+            if self.metrics:
+                self._update_queue_depth()
             return
+
+        # Record intent claimed
+        if self.metrics:
+            self.metrics.record_intent_claimed(intent["name"], self.worker_id)
 
         logger.info(f"Claimed intent: {intent['id']} (name: {intent['name']})")
 
         try:
             result = self.execute_intent(intent)
-            self.mark_succeeded(intent["id"], result)
+            self.mark_succeeded(intent["id"], intent["name"], result, execution_start)
         except Exception as e:
             logger.error(f"Intent {intent['id']} failed: {e}", exc_info=True)
             self.mark_failed(
-                intent["id"], intent["attempt_count"], intent["max_attempts"], str(e)
+                intent["id"],
+                intent["name"],
+                intent["attempt_count"],
+                intent["max_attempts"],
+                str(e),
+                execution_start,
             )
 
     def claim_intent(self) -> Optional[Dict[str, Any]]:
         """Claim a pending intent using SELECT FOR UPDATE SKIP LOCKED"""
         conn = None
         try:
-            conn = psycopg2.connect(self.db_url)
+            conn = self._connect()
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # Claim intent
                 cur.execute(
@@ -180,11 +241,13 @@ class IntentPoller:
         result = executor.execute(intent)
         return result
 
-    def mark_succeeded(self, intent_id: str, result: Any):
+    def mark_succeeded(
+        self, intent_id: str, workflow_name: str, result: Any, execution_start: float
+    ):
         """Mark intent as succeeded"""
         conn = None
         try:
-            conn = psycopg2.connect(self.db_url)
+            conn = self._connect()
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -198,6 +261,13 @@ class IntentPoller:
                 )
                 conn.commit()
                 logger.info(f"Intent {intent_id} succeeded")
+
+                # Record metrics
+                if self.metrics:
+                    duration = time.time() - execution_start
+                    self.metrics.record_intent_completed(
+                        workflow_name, self.worker_id, "succeeded", duration
+                    )
         except Exception as e:
             logger.error(
                 f"Error marking intent {intent_id} as succeeded: {e}", exc_info=True
@@ -209,7 +279,13 @@ class IntentPoller:
                 conn.close()
 
     def mark_failed(
-        self, intent_id: str, attempt_count: int, max_attempts: int, error: str
+        self,
+        intent_id: str,
+        workflow_name: str,
+        attempt_count: int,
+        max_attempts: int,
+        error: str,
+        execution_start: float,
     ):
         """Mark intent as failed with retry logic"""
         new_attempt_count = attempt_count + 1
@@ -221,7 +297,7 @@ class IntentPoller:
 
         conn = None
         try:
-            conn = psycopg2.connect(self.db_url)
+            conn = self._connect()
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -239,12 +315,51 @@ class IntentPoller:
                 logger.info(
                     f"Intent {intent_id} failed (attempt {new_attempt_count}/{max_attempts})"
                 )
+
+                # Record metrics
+                if self.metrics:
+                    duration = time.time() - execution_start
+                    self.metrics.record_intent_completed(
+                        workflow_name, self.worker_id, status, duration
+                    )
+
+                    # Record deadletter metric if workflow permanently failed
+                    if status == "deadletter":
+                        self.metrics.record_intent_deadletter(
+                            workflow_name, self.worker_id
+                        )
         except Exception as e:
             logger.error(
                 f"Error marking intent {intent_id} as failed: {e}", exc_info=True
             )
             if conn:
                 conn.rollback()
+        finally:
+            if conn:
+                conn.close()
+
+    def _update_queue_depth(self):
+        """Update queue depth metrics for all supported workflows"""
+        if not self.metrics:
+            return
+
+        conn = None
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                for workflow_name in self.supported_workflows:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM workflow_intent
+                        WHERE name = %s AND status = 'pending' AND deleted_at IS NULL
+                    """,
+                        (workflow_name,),
+                    )
+                    depth = cur.fetchone()[0]
+                    self.metrics.record_queue_depth(workflow_name, depth)
+        except Exception as e:
+            logger.error(f"Error updating queue depth: {e}", exc_info=True)
         finally:
             if conn:
                 conn.close()

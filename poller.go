@@ -19,6 +19,8 @@ type Poller struct {
 	pollInterval       time.Duration
 	workerID           string
 	stopCh             chan struct{}
+	metrics            MetricsCollector // Optional: metrics collector for observability
+	startTime          time.Time        // Worker start time for uptime calculation
 }
 
 // NewPoller creates a new intent poller for workers
@@ -48,6 +50,12 @@ func (p *Poller) SetPollInterval(interval time.Duration) {
 	p.pollInterval = interval
 }
 
+// SetMetrics sets the metrics collector (optional, pass nil to disable metrics)
+func (p *Poller) SetMetrics(m MetricsCollector) {
+	p.metrics = m
+	p.startTime = time.Now()
+}
+
 // Start begins polling for workflow intents
 func (p *Poller) Start(ctx context.Context) {
 	ticker := time.NewTicker(p.pollInterval)
@@ -73,21 +81,43 @@ func (p *Poller) Stop() {
 }
 
 func (p *Poller) pollAndExecute(ctx context.Context) {
+	// Record poll cycle and update worker metrics
+	if p.metrics != nil {
+		p.metrics.RecordPollCycle(p.workerID)
+		if !p.startTime.IsZero() {
+			p.metrics.UpdateWorkerUptime(p.workerID, time.Since(p.startTime).Seconds())
+			p.metrics.UpdateLastPollTimestamp(p.workerID, float64(time.Now().Unix()))
+		}
+	}
+
+	executionStart := time.Now()
+
 	// Claim an intent
 	intent, err := p.claimIntent(ctx)
 	if err != nil {
+		if p.metrics != nil {
+			p.metrics.RecordPollError(p.workerID, classifyError(err))
+		}
 		log.Printf("Failed to claim intent: %v", err)
 		return
 	}
 	if intent == nil {
-		// No work available
+		// No work available - update queue depth metrics
+		if p.metrics != nil {
+			p.updateQueueDepth(ctx)
+		}
 		return
+	}
+
+	// Record intent claim
+	if p.metrics != nil {
+		p.metrics.RecordIntentClaimed(intent.Name, p.workerID)
 	}
 
 	log.Printf("Claimed intent: %s (name: %s)", intent.ID, intent.Name)
 
 	// Execute the workflow
-	p.executeIntent(ctx, intent)
+	p.executeIntent(ctx, intent, executionStart)
 }
 
 func (p *Poller) claimIntent(ctx context.Context) (*WorkflowIntent, error) {
@@ -143,12 +173,12 @@ func (p *Poller) claimIntent(ctx context.Context) (*WorkflowIntent, error) {
 	return &intent, nil
 }
 
-func (p *Poller) executeIntent(ctx context.Context, intent *WorkflowIntent) {
+func (p *Poller) executeIntent(ctx context.Context, intent *WorkflowIntent, executionStart time.Time) {
 	// Find executor for this workflow
 	executor, ok := p.executors[intent.Name]
 	if !ok {
 		err := fmt.Errorf("no executor registered for workflow: %s", intent.Name)
-		p.markIntentFailed(ctx, intent, err)
+		p.markIntentFailed(ctx, intent, err, executionStart)
 		return
 	}
 
@@ -157,13 +187,13 @@ func (p *Poller) executeIntent(ctx context.Context, intent *WorkflowIntent) {
 
 	// Update intent status
 	if err != nil {
-		p.markIntentFailed(ctx, intent, err)
+		p.markIntentFailed(ctx, intent, err, executionStart)
 	} else {
-		p.markIntentSucceeded(ctx, intent, result)
+		p.markIntentSucceeded(ctx, intent, result, executionStart)
 	}
 }
 
-func (p *Poller) markIntentSucceeded(ctx context.Context, intent *WorkflowIntent, result interface{}) {
+func (p *Poller) markIntentSucceeded(ctx context.Context, intent *WorkflowIntent, result interface{}, executionStart time.Time) {
 	resultJSON, _ := json.Marshal(result)
 
 	query := `
@@ -179,9 +209,15 @@ func (p *Poller) markIntentSucceeded(ctx context.Context, intent *WorkflowIntent
 	} else {
 		log.Printf("Intent %s succeeded", intent.ID)
 	}
+
+	// Record metrics
+	if p.metrics != nil {
+		duration := time.Since(executionStart)
+		p.metrics.RecordIntentCompleted(intent.Name, p.workerID, "succeeded", duration)
+	}
 }
 
-func (p *Poller) markIntentFailed(ctx context.Context, intent *WorkflowIntent, execErr error) {
+func (p *Poller) markIntentFailed(ctx context.Context, intent *WorkflowIntent, execErr error, executionStart time.Time) {
 	newAttemptCount := intent.AttemptCount + 1
 	status := "pending"
 	runAfter := time.Now().Add(time.Duration(newAttemptCount*newAttemptCount) * time.Minute) // Exponential backoff
@@ -204,5 +240,36 @@ func (p *Poller) markIntentFailed(ctx context.Context, intent *WorkflowIntent, e
 		log.Printf("Failed to mark intent %s as failed: %v", intent.ID, err)
 	} else {
 		log.Printf("Intent %s failed (attempt %d/%d): %v", intent.ID, newAttemptCount, intent.MaxAttempts, execErr)
+	}
+
+	// Record metrics
+	if p.metrics != nil {
+		duration := time.Since(executionStart)
+		p.metrics.RecordIntentCompleted(intent.Name, p.workerID, status, duration)
+
+		// Record deadletter metric if workflow permanently failed
+		if status == "deadletter" {
+			p.metrics.RecordIntentDeadletter(intent.Name, p.workerID)
+		}
+	}
+}
+
+// updateQueueDepth queries and updates queue depth metrics for all supported workflows
+func (p *Poller) updateQueueDepth(ctx context.Context) {
+	if p.metrics == nil {
+		return
+	}
+
+	for _, workflowName := range p.supportedWorkflows {
+		var depth int
+		err := p.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM workflow_intent
+			 WHERE name = $1 AND status = 'pending' AND deleted_at IS NULL`,
+			workflowName,
+		).Scan(&depth)
+
+		if err == nil {
+			p.metrics.RecordQueueDepth(workflowName, depth)
+		}
 	}
 }
