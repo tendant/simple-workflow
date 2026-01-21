@@ -1,105 +1,201 @@
 #!/bin/bash
-# Integration test script for simple-workflow
+# End-to-end integration test
+# Actually starts a worker and processes workflows
 
 set -e
 
-echo "=================================================="
-echo "Simple-Workflow Integration Test"
-echo "=================================================="
-echo ""
+echo "=== End-to-End Integration Test ==="
+echo
 
-# Load .env if it exists
-if [ -f .env ]; then
-    echo "Loading configuration from .env..."
-    export $(cat .env | grep -v '^#' | xargs)
-fi
+# Database configuration
+DB_URL="${DATABASE_URL:-postgres://pas:pwd@localhost/pas?sslmode=disable&schema=workflow}"
 
-# Database connection (use env vars or defaults)
-DB_HOST="${DB_HOST:-localhost}"
-DB_PORT="${DB_PORT:-5432}"
-DB_USER="${DB_USER:-postgres}"
-DB_PASSWORD="${DB_PASSWORD:-postgres}"
-DB_NAME="${DB_NAME:-workflow}"
+echo "Database: $DB_URL"
+echo
 
-export PGPASSWORD="$DB_PASSWORD"
+# Clean up any existing test workflows
+echo "1. Cleaning up test data..."
+psql "postgres://pas:pwd@localhost/pas" <<EOF
+SET search_path TO workflow;
+DELETE FROM workflow_run WHERE type LIKE 'integration.%';
+EOF
+echo "✓ Clean up complete"
+echo
 
-# Colors
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
+# Test 1: Start Go worker in background
+echo "2. Starting Go worker in background..."
+cat > /tmp/integration_worker.go <<'GOCODE'
+package main
 
-# Helper functions
-check_table() {
-    local table=$1
-    echo -n "Checking table ${table}... "
-    if psql -h $DB_HOST -U $DB_USER -d $DB_NAME -c "\d workflow.${table}" > /dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC}"
-        return 0
-    else
-        echo -e "${RED}✗${NC}"
-        return 1
-    fi
-}
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"time"
 
-query_db() {
-    psql -h $DB_HOST -U $DB_USER -d $DB_NAME -c "$1"
-}
-
-echo "1. Verifying Database Schema"
-echo "----------------------------"
-check_table "workflow_run"
-check_table "workflow_event"
-check_table "workflow_registry"
-echo ""
-
-echo "2. Checking Workflow Registry"
-echo "-----------------------------"
-query_db "SELECT workflow_name, runtime, is_enabled FROM workflow.workflow_registry ORDER BY workflow_name;"
-echo ""
-
-echo "3. Checking Workflow Runs"
-echo "-------------------------"
-RUN_COUNT=$(query_db "SELECT COUNT(*) FROM workflow.workflow_run WHERE deleted_at IS NULL;" -t | tr -d ' ')
-echo "Total active workflow runs: $RUN_COUNT"
-if [ "$RUN_COUNT" -gt 0 ]; then
-    echo ""
-    query_db "SELECT id, type, status, attempt, created_at FROM workflow.workflow_run WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 10;"
-fi
-echo ""
-
-echo "4. Test: Create a Thumbnail Workflow Run"
-echo "-----------------------------------------"
-CONTENT_ID="test-$(date +%s)"
-echo "Creating workflow run for content_id: $CONTENT_ID"
-
-query_db "
-INSERT INTO workflow.workflow_run (type, payload, idempotency_key)
-VALUES (
-    'content.thumbnail.v1',
-    '{\"content_id\": \"$CONTENT_ID\", \"width\": 300, \"height\": 300}'::jsonb,
-    'test:thumbnail:$CONTENT_ID:300x300'
+	simpleworkflow "github.com/tendant/simple-workflow"
+	_ "github.com/lib/pq"
 )
-RETURNING id, type, status;
-"
-echo ""
 
-echo "5. Verify Workflow Run Created"
-echo "-------------------------------"
-query_db "SELECT id, type, status, payload, deleted_at FROM workflow.workflow_run WHERE payload->>'content_id' = '$CONTENT_ID';"
-echo ""
+func main() {
+	dbURL := os.Getenv("DATABASE_URL")
+	poller, err := simpleworkflow.NewPoller(dbURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer poller.Close()
 
-echo "6. Check Workflow Events"
-echo "------------------------"
-query_db "SELECT event_type, COUNT(*) as count FROM workflow.workflow_event GROUP BY event_type ORDER BY count DESC;"
-echo ""
+	// Register handler that logs to file
+	poller.HandleFunc("integration.test.v1", func(ctx context.Context, run *simpleworkflow.WorkflowRun) (interface{}, error) {
+		var payload map[string]interface{}
+		json.Unmarshal(run.Payload, &payload)
 
-echo "=================================================="
-echo "Integration test complete!"
-echo ""
-echo "Next steps:"
-echo "1. Start pipeline-worker to process thumbnail workflow runs"
-echo "2. Upload an image via PAS API to trigger automatic thumbnail generation"
-echo "3. Verify workflow runs are claimed and executed"
-echo "4. Check workflow_event table for audit trail"
-echo "=================================================="
+		msg := fmt.Sprintf("Processed workflow %s with payload: %v", run.ID, payload)
+		fmt.Println(msg)
+
+		// Write result to file so test can verify
+		f, _ := os.Create("/tmp/integration_test_result.txt")
+		defer f.Close()
+		f.WriteString(msg)
+
+		return map[string]string{
+			"status": "completed",
+			"message": "Integration test successful",
+		}, nil
+	})
+
+	ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
+	fmt.Println("Worker started, waiting for workflows...")
+	poller.Start(ctx)
+}
+GOCODE
+
+cd /Users/lei/workspace/pas/simple-workflow
+go run /tmp/integration_worker.go &
+WORKER_PID=$!
+echo "✓ Worker started (PID: $WORKER_PID)"
+echo
+
+# Wait for worker to initialize
+sleep 2
+
+# Test 2: Submit workflow
+echo "3. Submitting workflow..."
+cat > /tmp/integration_client.go <<'GOCODE'
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	simpleworkflow "github.com/tendant/simple-workflow"
+	_ "github.com/lib/pq"
+)
+
+func main() {
+	dbURL := os.Getenv("DATABASE_URL")
+	client, err := simpleworkflow.NewClient(dbURL)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer client.Close()
+
+	runID, err := client.Submit("integration.test.v1", map[string]interface{}{
+		"test_id": "integration-001",
+		"timestamp": "2024-01-20",
+	}).Execute(context.Background())
+
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("%s\n", runID)
+}
+GOCODE
+
+RUN_ID=$(go run /tmp/integration_client.go)
+echo "✓ Workflow submitted: $RUN_ID"
+echo
+
+# Test 3: Wait for processing (max 15 seconds)
+echo "4. Waiting for workflow to be processed..."
+MAX_WAIT=15
+WAITED=0
+while [ $WAITED -lt $MAX_WAIT ]; do
+	STATUS=$(psql "postgres://pas:pwd@localhost/pas" -t -A -c "SET search_path TO workflow; SELECT status FROM workflow_run WHERE id = '$RUN_ID';" | grep -v "^SET$")
+	STATUS=$(echo $STATUS | tr -d ' \n')
+
+	if [ "$STATUS" = "succeeded" ]; then
+		echo "✓ Workflow processed successfully!"
+		break
+	elif [ "$STATUS" = "failed" ]; then
+		echo "❌ Workflow failed"
+		psql "postgres://pas:pwd@localhost/pas" -c "SET search_path TO workflow; SELECT id, status, last_error FROM workflow_run WHERE id = '$RUN_ID';"
+		kill $WORKER_PID 2>/dev/null || true
+		exit 1
+	fi
+
+	echo "  Status: $STATUS (waiting...)"
+	sleep 1
+	WAITED=$((WAITED + 1))
+done
+
+if [ $WAITED -eq $MAX_WAIT ]; then
+	echo "❌ Timeout waiting for workflow to complete"
+	kill $WORKER_PID 2>/dev/null || true
+	exit 1
+fi
+echo
+
+# Test 4: Verify result
+echo "5. Verifying workflow result..."
+psql "postgres://pas:pwd@localhost/pas" <<EOF
+SET search_path TO workflow;
+SELECT
+	id,
+	type,
+	status,
+	result,
+	attempt
+FROM workflow_run
+WHERE id = '$RUN_ID';
+EOF
+
+if [ -f /tmp/integration_test_result.txt ]; then
+	echo
+	echo "Worker output:"
+	cat /tmp/integration_test_result.txt
+	echo
+	echo "✓ Worker processed the workflow successfully"
+else
+	echo "⚠ Worker output file not found"
+fi
+echo
+
+# Test 5: Verify events
+echo "6. Verifying audit events..."
+psql "postgres://pas:pwd@localhost/pas" <<EOF
+SET search_path TO workflow;
+SELECT
+	event_type,
+	created_at
+FROM workflow_event
+WHERE workflow_id = '$RUN_ID'
+ORDER BY created_at;
+EOF
+echo
+
+# Cleanup
+echo "7. Cleaning up..."
+kill $WORKER_PID 2>/dev/null || true
+wait $WORKER_PID 2>/dev/null || true
+rm -f /tmp/integration_worker.go /tmp/integration_client.go /tmp/integration_test_result.txt
+echo "✓ Cleanup complete"
+echo
+
+echo "=== Integration Test Passed! 🎉 ==="
