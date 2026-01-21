@@ -5,11 +5,13 @@ Polls workflow_run table and executes Python workflows
 
 import json
 import logging
+import os
 import random
+import socket
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, List
 from urllib.parse import urlparse, parse_qs, urlunparse
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -77,36 +79,58 @@ class WorkflowExecutor(ABC):
         pass
 
 
+class FunctionExecutorAdapter(WorkflowExecutor):
+    """Adapter that wraps a function as a WorkflowExecutor"""
+
+    def __init__(self, func: Callable[[WorkflowRun], Any]):
+        self.func = func
+
+    def execute(self, run: WorkflowRun) -> Any:
+        return self.func(run)
+
+
 class IntentPoller:
     """Polls workflow_run table and executes Python workflows"""
 
     def __init__(
         self,
         db_url: str,
-        type_prefixes: list[str],
-        worker_id: str = "python-worker",
+        type_prefixes: Optional[List[str]] = None,
+        worker_id: Optional[str] = None,
         poll_interval: int = 2,
         lease_duration: int = 30,
         metrics: Optional[MetricsCollector] = None,
     ):
         """
-        Initialize the workflow run poller.
+        Initialize the workflow run poller with simplified API.
 
         Args:
-            db_url: PostgreSQL connection string (may include search_path= query parameter)
-            type_prefixes: List of type prefixes this poller handles (e.g., ["billing.%", "media.%"])
-            worker_id: Unique identifier for this worker (default: "python-worker")
+            db_url: PostgreSQL connection string (may include ?schema= or ?search_path= parameter)
+                    Example: "postgres://user:pass@localhost/db?schema=workflow"
+            type_prefixes: List of type prefixes this poller handles (e.g., ["billing.%"])
+                          If None, auto-detects from registered handlers (recommended)
+            worker_id: Unique identifier for this worker
+                      If None, defaults to "hostname-pid"
             poll_interval: Polling interval in seconds (default: 2)
             lease_duration: Lease duration in seconds (default: 30)
             metrics: Optional metrics collector for observability
         """
-        # Parse URL to extract and remove search_path (psycopg2 doesn't support it as query param)
+        # Parse URL to extract and handle search_path/schema
         parsed = urlparse(db_url)
         if parsed.query:
             query_params = parse_qs(parsed.query)
-            self.search_path = query_params.get('search_path', ['public'])[0]
-            # Remove search_path from query params
-            filtered_params = {k: v for k, v in query_params.items() if k != 'search_path'}
+
+            # Check for schema parameter (our custom parameter)
+            if 'schema' in query_params:
+                self.search_path = query_params['schema'][0]
+                filtered_params = {k: v for k, v in query_params.items() if k != 'schema'}
+            elif 'search_path' in query_params:
+                self.search_path = query_params['search_path'][0]
+                filtered_params = {k: v for k, v in query_params.items() if k != 'search_path'}
+            else:
+                self.search_path = 'workflow'
+                filtered_params = query_params
+
             # Rebuild query string
             new_query = '&'.join(f"{k}={v[0]}" for k, v in filtered_params.items())
             # Rebuild URL
@@ -116,14 +140,24 @@ class IntentPoller:
             ))
         else:
             self.db_url = db_url
-            self.search_path = 'public'
+            self.search_path = 'workflow'
 
         self.type_prefixes = type_prefixes
-        self.worker_id = worker_id
+        self.auto_detect_prefix = type_prefixes is None
+
+        # Generate default worker ID: hostname-pid
+        if worker_id is None:
+            hostname = socket.gethostname() or 'unknown'
+            pid = os.getpid()
+            self.worker_id = f"{hostname}-{pid}"
+        else:
+            self.worker_id = worker_id
+
         self.poll_interval = poll_interval
         self.lease_duration = lease_duration
         self.running = False
         self.executors: Dict[str, WorkflowExecutor] = {}
+        self.function_handlers: Dict[str, Callable] = {}  # For function-based handlers
         self.metrics = metrics
         self.start_time = time.time()
 
@@ -144,6 +178,70 @@ class IntentPoller:
         self.executors[workflow_type] = executor
         logger.info(f"Registered executor for workflow type: {workflow_type}")
 
+    def handle_func(self, workflow_type: str, func: Callable[[WorkflowRun], Any]) -> 'IntentPoller':
+        """
+        Register a function handler for a workflow type (simplified API).
+        No need to create an executor class.
+
+        Args:
+            workflow_type: Workflow type (e.g., "billing.invoice.v1")
+            func: Function that takes a WorkflowRun and returns a result
+
+        Returns:
+            self for method chaining
+
+        Example:
+            poller.handle_func("billing.invoice.v1", lambda run: {...})
+
+            # Or as decorator:
+            @poller.handler("billing.invoice.v1")
+            def process_invoice(run):
+                return result
+        """
+        self.function_handlers[workflow_type] = func
+        # Wrap function as executor
+        self.executors[workflow_type] = FunctionExecutorAdapter(func)
+        logger.info(f"Registered function handler for workflow type: {workflow_type}")
+        return self
+
+    def handler(self, workflow_type: str):
+        """
+        Decorator for registering workflow handlers.
+
+        Example:
+            @poller.handler("billing.invoice.v1")
+            def process_invoice(run: WorkflowRun):
+                payload = run.payload
+                # Process invoice
+                return {"status": "completed"}
+        """
+        def decorator(func: Callable[[WorkflowRun], Any]):
+            self.handle_func(workflow_type, func)
+            return func
+        return decorator
+
+    def _detect_type_prefixes(self) -> List[str]:
+        """Auto-detect type prefixes from registered handlers"""
+        prefix_set = set()
+
+        for workflow_type in self.executors.keys():
+            # Skip if already a prefix pattern
+            if workflow_type.endswith('%'):
+                prefix_set.add(workflow_type)
+                continue
+
+            # Extract prefix (everything up to first dot + %)
+            parts = workflow_type.split('.')
+            if len(parts) > 1:
+                # Use domain prefix (e.g., "billing.invoice.v1" -> "billing.%")
+                prefix = parts[0] + '.%'
+                prefix_set.add(prefix)
+            else:
+                # No dots, use exact match
+                prefix_set.add(workflow_type)
+
+        return list(prefix_set)
+
     def _connect(self):
         """Create a database connection and set search_path"""
         conn = psycopg2.connect(self.db_url)
@@ -155,6 +253,14 @@ class IntentPoller:
 
     def start(self):
         """Start polling loop (blocking)"""
+        # Auto-detect type prefixes if needed
+        if self.auto_detect_prefix and not self.type_prefixes:
+            self.type_prefixes = self._detect_type_prefixes()
+
+        # Validate that at least one handler is registered
+        if not self.executors:
+            raise ValueError("No workflow handlers registered. Use handle_func() or register_executor() to register handlers.")
+
         self.running = True
         logger.info(
             f"Workflow poller started, watching type prefixes: {self.type_prefixes}"

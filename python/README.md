@@ -14,56 +14,81 @@ Or install the package:
 pip install -e .
 ```
 
-## Quick Start
+## Quick Start (Simplified API)
 
-### 1. Implement a Workflow Executor
+### 1. Create and Submit Workflows (Producer)
 
 ```python
-from simpleworkflow import WorkflowExecutor, WorkflowRun
+from simpleworkflow import Client
 
-class EmailExecutor(WorkflowExecutor):
-    def execute(self, run: WorkflowRun):
-        # Access workflow run data
-        payload = run.payload
-        to_email = payload['to']
-        subject = payload['subject']
-        body = payload['body']
+# Create client from connection string
+client = Client("postgres://user:pass@localhost/db?schema=workflow")
 
-        # Send email (your implementation)
-        print(f"Sending email to {to_email}: {subject}")
-        # send_email(to_email, subject, body)
+# Submit workflow with fluent API
+run_id = client.submit("notify.email.v1", {
+    "to": "user@example.com",
+    "subject": "Welcome!",
+    "body": "Thanks for signing up"
+}).with_idempotency("email:user@example.com:welcome").execute()
 
-        return {"sent": True, "to": to_email}
+print(f"Created workflow run: {run_id}")
+
+# Cancel a workflow
+client.cancel(run_id)
 ```
 
-### 2. Create and Start the Poller
+### 2. Process Workflows with Function Handlers (Worker)
 
 ```python
-import os
-from simpleworkflow import IntentPoller
+from simpleworkflow import IntentPoller, WorkflowRun
 
-# Database connection (must include search_path parameter)
-db_url = os.getenv('DATABASE_URL', 'postgres://postgres:postgres@localhost/workflow')
-if '?' in db_url:
-    db_url += '&search_path=workflow'
-else:
-    db_url += '?search_path=workflow'
+# Create poller (auto-detects type prefix!)
+poller = IntentPoller("postgres://user:pass@localhost/db?schema=workflow")
 
-# Create poller with type-prefix routing
-type_prefixes = ['notify.%']  # Handles all notification workflows
-poller = IntentPoller(
-    db_url=db_url,
-    type_prefixes=type_prefixes,
-    worker_id='email-worker-1',
-    poll_interval=2,         # seconds
-    lease_duration=30        # seconds
-)
+# Register handler using decorator (no executor class needed!)
+@poller.handler("notify.email.v1")
+def send_email(run: WorkflowRun):
+    payload = run.payload
+    to_email = payload['to']
+    subject = payload['subject']
+    body = payload['body']
 
-# Register executor
-email_executor = EmailExecutor()
-poller.register_executor('notify.email.v1', email_executor)
+    print(f"Sending email to {to_email}: {subject}")
+    # send_email(to_email, subject, body)
 
-# Start polling (blocking)
+    return {"sent": True, "to": to_email}
+
+# Start polling (blocks until Ctrl+C)
+# Type prefix "notify.%" is auto-detected from handlers!
+poller.start()
+```
+
+**What's simplified:**
+- ✅ No executor classes - use functions directly
+- ✅ Decorator-style handler registration
+- ✅ Type prefix auto-detected from handlers
+- ✅ Worker ID auto-generated: `hostname-pid`
+- ✅ Client class for submitting workflows (was missing!)
+- ✅ Fluent API for workflow submission
+
+### 3. Advanced: Using Executor Classes
+
+For stateful handlers, you can still use executor classes:
+
+```python
+from simpleworkflow import IntentPoller, WorkflowExecutor, WorkflowRun
+
+class EmailExecutor(WorkflowExecutor):
+    def __init__(self, smtp_config):
+        self.smtp_config = smtp_config
+
+    def execute(self, run: WorkflowRun):
+        payload = run.payload
+        # Use self.smtp_config...
+        return {"sent": True}
+
+poller = IntentPoller("postgres://user:pass@localhost/db?schema=workflow")
+poller.register_executor('notify.email.v1', EmailExecutor(smtp_config))
 poller.start()
 ```
 

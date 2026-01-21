@@ -1,10 +1,11 @@
 """
 Simple-Workflow Python Library
 
-A generic, durable intent system for asynchronous work.
+A generic, durable workflow system for asynchronous work.
 """
 
-from .poller import IntentPoller, WorkflowExecutor
+from .client import Client
+from .poller import IntentPoller, WorkflowExecutor, WorkflowRun
 
 __version__ = "0.1.0"
-__all__ = ["IntentPoller", "WorkflowExecutor"]
+__all__ = ["Client", "IntentPoller", "WorkflowExecutor", "WorkflowRun"]

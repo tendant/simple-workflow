@@ -71,36 +71,33 @@ Or manually with goose:
 goose -dir migrations postgres "host=localhost user=postgres dbname=workflow password=postgres sslmode=disable search_path=workflow" up
 ```
 
-### 2. Producer: Create Workflow Runs
+### 2. Producer: Create Workflow Runs (Go)
+
+The simplified API uses connection strings and fluent builders:
 
 ```go
 package main
 
 import (
     "context"
-    "database/sql"
-
     simpleworkflow "github.com/tendant/simple-workflow"
     _ "github.com/lib/pq"
 )
 
 func main() {
-    db, _ := sql.Open("postgres", "postgres://user:pass@localhost/db?sslmode=disable")
-    defer db.Close()
+    // Create client from connection string
+    client, _ := simpleworkflow.NewClient("postgres://user:pass@localhost/db?schema=workflow")
+    defer client.Close()
 
-    // Create workflow client
-    client := simpleworkflow.NewClient(db)
-
-    // Create workflow run
-    runID, err := client.Create(context.Background(), simpleworkflow.Intent{
-        Type: "content.thumbnail.v1",  // Changed from Name to Type
-        Payload: map[string]interface{}{
-            "content_id": "c_123",
-            "width":      300,
-            "height":     300,
-        },
-        IdempotencyKey: "thumbnail:c_123:300x300",
-    })
+    // Submit workflow with fluent API
+    runID, err := client.Submit("content.thumbnail.v1", map[string]interface{}{
+        "content_id": "c_123",
+        "width":      300,
+        "height":     300,
+    }).
+    WithIdempotency("thumbnail:c_123:300x300").
+    WithPriority(10).
+    Execute(context.Background())
 
     if err != nil {
         panic(err)
@@ -113,77 +110,67 @@ func main() {
 }
 ```
 
-### 3. Worker: Execute Workflow Runs
+### 3. Worker: Execute Workflow Runs (Go)
+
+The simplified API uses function handlers instead of executor structs:
 
 ```go
 package main
 
 import (
     "context"
-    "database/sql"
     "encoding/json"
     "fmt"
-    "time"
-
     simpleworkflow "github.com/tendant/simple-workflow"
     _ "github.com/lib/pq"
 )
 
-// ThumbnailExecutor implements simpleworkflow.WorkflowExecutor
-type ThumbnailExecutor struct{}
-
-func (e *ThumbnailExecutor) Execute(ctx context.Context, run *simpleworkflow.WorkflowRun) (interface{}, error) {
-    var params struct {
-        ContentID string `json:"content_id"`
-        Width     int    `json:"width"`
-        Height    int    `json:"height"`
-    }
-    if err := json.Unmarshal(run.Payload, &params); err != nil {
-        return nil, err
-    }
-
-    // Execute workflow logic
-    fmt.Printf("Generating thumbnail for %s (%dx%d)\n", params.ContentID, params.Width, params.Height)
-
-    // For long-running jobs, extend the lease
-    // run.Heartbeat(ctx, 30*time.Second)
-
-    // Check for cancellation
-    // if cancelled, _ := run.IsCancelled(ctx); cancelled {
-    //     return nil, fmt.Errorf("workflow cancelled")
-    // }
-
-    return map[string]string{"status": "completed"}, nil
-}
-
 func main() {
-    db, _ := sql.Open("postgres", "postgres://user:pass@localhost/db?sslmode=disable")
-    defer db.Close()
+    // Create poller from connection string (auto-detects type prefix!)
+    poller, _ := simpleworkflow.NewPoller("postgres://user:pass@localhost/db?schema=workflow")
+    defer poller.Close()
 
-    // Create poller with configuration
-    config := simpleworkflow.PollerConfig{
-        TypePrefixes:  []string{"content.%"},  // Type-prefix routing
-        LeaseDuration: 30 * time.Second,       // Lease duration
-        PollInterval:  2 * time.Second,        // Poll interval
-        WorkerID:      "thumbnail-worker-1",   // Worker identifier
-    }
-    poller := simpleworkflow.NewPoller(db, config)
+    // Register handler using inline function (no executor struct needed)
+    poller.HandleFunc("content.thumbnail.v1", func(ctx context.Context, run *simpleworkflow.WorkflowRun) (interface{}, error) {
+        var params struct {
+            ContentID string `json:"content_id"`
+            Width     int    `json:"width"`
+            Height    int    `json:"height"`
+        }
+        if err := json.Unmarshal(run.Payload, &params); err != nil {
+            return nil, err
+        }
 
-    // Register executor
-    poller.RegisterExecutor("content.thumbnail.v1", &ThumbnailExecutor{})
+        fmt.Printf("Generating thumbnail for %s (%dx%d)\n", params.ContentID, params.Width, params.Height)
 
-    // Optional: Set up Prometheus metrics
-    // metrics := simpleworkflow.NewPrometheusMetrics(nil)
-    // poller.SetMetrics(metrics)
+        // For long-running jobs, extend the lease
+        // run.Heartbeat(ctx, 30*time.Second)
 
-    // Start polling
+        // Check for cancellation
+        // if cancelled, _ := run.IsCancelled(ctx); cancelled {
+        //     return nil, fmt.Errorf("workflow cancelled")
+        // }
+
+        return map[string]string{"status": "completed"}, nil
+    })
+
+    // Start polling (blocks until interrupted)
+    // Type prefix "content.%" is auto-detected from registered handlers!
     poller.Start(context.Background())
 }
 ```
 
-### 4. Python Worker (Alternative)
+**What's simplified:**
+- ✅ No manual `sql.Open()` - connection string does it all
+- ✅ No executor structs - use inline functions
+- ✅ No manual configuration - smart defaults (hostname-pid, 30s lease, 2s poll)
+- ✅ Type prefix auto-detected from handlers
+- ✅ Connection management automatic with `Close()`
+- ✅ Worker ID auto-generated: `hostname-pid`
 
-Python workers use the same `workflow_run` table:
+### 4. Worker: Execute Workflow Runs (Python)
+
+Python workers use the same `workflow_run` table and have similar simplified API:
 
 ```python
 #!/usr/bin/env python3
@@ -191,7 +178,7 @@ from simpleworkflow import IntentPoller, WorkflowExecutor, WorkflowRun
 
 class ThumbnailExecutor(WorkflowExecutor):
     def execute(self, run: WorkflowRun):
-        payload = run.payload  # Access as attribute
+        payload = run.payload
         content_id = payload['content_id']
         width = payload['width']
         height = payload['height']
@@ -259,23 +246,95 @@ See `python/README.md` for complete Python documentation.
 
 ## API Reference
 
-### Producer API
+### Simplified API (Recommended)
 
-#### `Client`
+#### Producer API
+
+**Create Client:**
+```go
+// From connection string (manages connection automatically)
+client, err := simpleworkflow.NewClient("postgres://user:pass@host/db?schema=workflow")
+defer client.Close()
+
+// Or use existing DB connection
+client := simpleworkflow.NewClientWithDB(db)
+```
+
+**Submit Workflows:**
+```go
+// Fluent API with method chaining
+runID, err := client.Submit("workflow.type.v1", payload).
+    WithIdempotency("unique-key").
+    WithPriority(10).
+    WithMaxAttempts(5).
+    RunIn(5 * time.Minute).  // or RunAfter(time.Time)
+    Execute(ctx)
+
+// Cancel workflow
+err := client.Cancel(ctx, runID)
+```
+
+#### Worker API
+
+**Create Poller:**
+```go
+// From connection string (auto-detects type prefix from handlers!)
+poller, err := simpleworkflow.NewPoller("postgres://user:pass@host/db?schema=workflow")
+defer poller.Close()
+
+// Or use existing DB connection
+poller := simpleworkflow.NewPollerWithDB(db)
+
+// Optional: Configure with fluent API
+poller.WithWorkerID("custom-worker").
+    WithLeaseDuration(60 * time.Second).
+    WithPollInterval(5 * time.Second).
+    WithTypePrefixes("billing.%", "media.%")  // Override auto-detection
+```
+
+**Register Handlers:**
+```go
+// Function handler (no executor struct needed!)
+poller.HandleFunc("billing.invoice.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) {
+    // Process workflow
+    return result, nil
+})
+
+// Or use executor struct for stateful handlers
+poller.Handle("billing.payment.v1", &PaymentExecutor{})
+
+// Start polling (blocks until context cancelled)
+poller.Start(ctx)
+```
+
+**Smart Defaults:**
+- Worker ID: `hostname-pid` (e.g., `my-server-12345`)
+- Lease duration: `30 seconds`
+- Poll interval: `2 seconds`
+- Type prefixes: Auto-detected from registered handlers
+- Schema: `workflow` (or from `?schema=` parameter)
+
+---
+
+### Advanced API (Backward Compatible)
+
+For advanced use cases where you need full control:
+
+#### `Client` (Old API)
 
 ```go
 type Client struct { /* ... */ }
 
-func NewClient(db *sql.DB) *Client
-func (c *Client) Create(ctx context.Context, intent Intent) (string, error)
-func (c *Client) Cancel(ctx context.Context, runID string) error  // NEW: Cooperative cancellation
+func NewClientWithDB(db *sql.DB) *Client  // Use existing DB
+func (c *Client) Create(ctx context.Context, intent Intent) (string, error)  // Deprecated: Use Submit()
+func (c *Client) Cancel(ctx context.Context, runID string) error
 ```
 
 #### `Intent`
 
 ```go
 type Intent struct {
-    Type           string      // Workflow type (e.g. "content.thumbnail.v1") - RENAMED from Name
+    Type           string      // Workflow type (e.g. "content.thumbnail.v1")
     Payload        interface{} // JSON-encodable data
     Priority       int         // Lower executes first (default: 100)
     RunAfter       time.Time   // Schedule for future (default: now)
@@ -284,9 +343,7 @@ type Intent struct {
 }
 ```
 
-### Worker API
-
-#### `PollerConfig`
+#### `PollerConfig` (Old API)
 
 ```go
 type PollerConfig struct {
