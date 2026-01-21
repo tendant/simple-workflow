@@ -59,3 +59,5 @@ env/
 # Editor/IDE
 # .idea/
 # .vscode/
+
+.claude/
