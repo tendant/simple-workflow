@@ -316,21 +316,11 @@ poller.Start(ctx)
 
 ---
 
-### Advanced API (Backward Compatible)
-
-For advanced use cases where you need full control:
-
-#### `Client` (Old API)
-
-```go
-type Client struct { /* ... */ }
-
-func NewClientWithDB(db *sql.DB) *Client  // Use existing DB
-func (c *Client) Create(ctx context.Context, intent Intent) (string, error)  // Deprecated: Use Submit()
-func (c *Client) Cancel(ctx context.Context, runID string) error
-```
+### Core Types
 
 #### `Intent`
+
+Used with `Submit()` builder:
 
 ```go
 type Intent struct {
@@ -343,40 +333,19 @@ type Intent struct {
 }
 ```
 
-#### `PollerConfig` (Old API)
-
-```go
-type PollerConfig struct {
-    TypePrefixes  []string      // Type prefixes to match (e.g. ["billing.%", "media.%"]) - NEW
-    LeaseDuration time.Duration // Lease duration (default: 30s) - NEW
-    PollInterval  time.Duration // Poll interval (default: 2s)
-    WorkerID      string        // Worker identifier (default: "go-worker")
-}
-```
-
-#### `Poller`
-
-```go
-type Poller struct { /* ... */ }
-
-func NewPoller(db *sql.DB, config PollerConfig) *Poller  // NEW: Takes config instead of workflow list
-func (p *Poller) RegisterExecutor(workflowType string, executor WorkflowExecutor)
-func (p *Poller) SetMetrics(m MetricsCollector)  // Optional: Prometheus metrics
-func (p *Poller) Start(ctx context.Context)
-func (p *Poller) Stop()
-```
-
 #### `WorkflowRun`
+
+Passed to workflow executors:
 
 ```go
 type WorkflowRun struct {
     ID          string
-    Type        string  // RENAMED from Name
+    Type        string
     Payload     []byte
-    Attempt     int     // RENAMED from AttemptCount
+    Attempt     int
     MaxAttempts int
 
-    // NEW: Functions for long-running workflows
+    // Functions for long-running workflows
     Heartbeat    HeartbeatFunc          // Extend the lease
     IsCancelled  CancellationCheckFunc  // Check if cancelled
 }
@@ -388,9 +357,11 @@ type CancellationCheckFunc func(ctx context.Context) (bool, error)
 
 #### `WorkflowExecutor`
 
+Interface for stateful executors (optional, can use functions instead):
+
 ```go
 type WorkflowExecutor interface {
-    Execute(ctx context.Context, run *WorkflowRun) (interface{}, error)  // UPDATED: run instead of intent
+    Execute(ctx context.Context, run *WorkflowRun) (interface{}, error)
 }
 ```
 

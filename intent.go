@@ -12,8 +12,7 @@ import (
 
 // Client manages workflow runs in the database (Producer API)
 type Client struct {
-	db     *sql.DB
-	ownsDB bool // true if Client opened the DB connection
+	db *sql.DB
 }
 
 // NewClient creates a new client from a PostgreSQL connection string.
@@ -44,33 +43,19 @@ func NewClient(connString string) (*Client, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	return &Client{
-		db:     db,
-		ownsDB: true,
-	}, nil
+	return &Client{db: db}, nil
 }
 
-// NewClientWithDB creates a new client using an existing database connection.
-// Use this if you already have a connection pool or want to manage connections yourself.
-// The client will NOT close the database connection.
-func NewClientWithDB(db *sql.DB) *Client {
-	return &Client{
-		db:     db,
-		ownsDB: false,
-	}
-}
-
-// Close closes the database connection if it was opened by NewClient.
-// If the client was created with NewClientWithDB, this is a no-op.
+// Close closes the database connection.
 func (c *Client) Close() error {
-	if c.ownsDB && c.db != nil {
+	if c.db != nil {
 		return c.db.Close()
 	}
 	return nil
 }
 
-// Create inserts a new workflow run
-func (c *Client) Create(ctx context.Context, intent Intent) (string, error) {
+// create inserts a new workflow run (internal method)
+func (c *Client) create(ctx context.Context, intent Intent) (string, error) {
 	payloadJSON, err := json.Marshal(intent.Payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal payload: %w", err)
@@ -233,5 +218,5 @@ func (s *SubmitBuilder) RunIn(d time.Duration) *SubmitBuilder {
 // Execute submits the workflow run and returns its ID.
 // Returns empty string if idempotency key conflict (run already exists).
 func (s *SubmitBuilder) Execute(ctx context.Context) (string, error) {
-	return s.client.Create(ctx, s.intent)
+	return s.client.create(ctx, s.intent)
 }

@@ -30,7 +30,6 @@ type Poller struct {
 	stopCh           chan struct{}
 	metrics          MetricsCollector // Optional: metrics collector for observability
 	startTime        time.Time        // Worker start time for uptime calculation
-	ownsDB           bool             // true if Poller opened the DB connection
 	autoDetectPrefix bool             // true if type prefixes should be auto-detected from handlers
 }
 
@@ -76,65 +75,8 @@ func NewPoller(connString string) (*Poller, error) {
 		leaseDuration:    30 * time.Second, // default
 		workerID:         workerID,
 		stopCh:           make(chan struct{}),
-		ownsDB:           true,
 		autoDetectPrefix: true,
 	}, nil
-}
-
-// NewPollerWithDB creates a new workflow run poller using an existing database connection.
-// Use this if you already have a connection pool or want to manage connections yourself.
-// The poller will NOT close the database connection.
-func NewPollerWithDB(db *sql.DB) *Poller {
-	hostname, _ := os.Hostname()
-	if hostname == "" {
-		hostname = "unknown"
-	}
-	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
-
-	return &Poller{
-		db:               db,
-		typePrefixes:     nil, // Will be auto-detected
-		executors:        make(map[string]WorkflowExecutor),
-		pollInterval:     2 * time.Second,  // default
-		leaseDuration:    30 * time.Second, // default
-		workerID:         workerID,
-		stopCh:           make(chan struct{}),
-		ownsDB:           false,
-		autoDetectPrefix: true,
-	}
-}
-
-// NewPollerWithConfig creates a new workflow run poller with explicit configuration.
-// This is the old API kept for backward compatibility.
-//
-// Deprecated: Use NewPoller(connString) or NewPollerWithDB(db) with fluent configuration instead.
-func NewPollerWithConfig(db *sql.DB, config PollerConfig) *Poller {
-	// Set defaults
-	if config.LeaseDuration == 0 {
-		config.LeaseDuration = 30 * time.Second
-	}
-	if config.PollInterval == 0 {
-		config.PollInterval = 2 * time.Second
-	}
-	if config.WorkerID == "" {
-		hostname, _ := os.Hostname()
-		if hostname == "" {
-			hostname = "unknown"
-		}
-		config.WorkerID = fmt.Sprintf("%s-%d", hostname, os.Getpid())
-	}
-
-	return &Poller{
-		db:               db,
-		typePrefixes:     config.TypePrefixes,
-		executors:        make(map[string]WorkflowExecutor),
-		pollInterval:     config.PollInterval,
-		leaseDuration:    config.LeaseDuration,
-		workerID:         config.WorkerID,
-		stopCh:           make(chan struct{}),
-		ownsDB:           false,
-		autoDetectPrefix: len(config.TypePrefixes) == 0, // Auto-detect if not specified
-	}
 }
 
 // WithWorkerID sets a custom worker ID.
@@ -187,16 +129,9 @@ func (p *Poller) Handle(workflowType string, executor WorkflowExecutor) *Poller 
 	return p
 }
 
-// RegisterExecutor registers a workflow executor for a specific workflow type.
-// Deprecated: Use Handle() or HandleFunc() instead.
-func (p *Poller) RegisterExecutor(workflowType string, executor WorkflowExecutor) {
-	p.executors[workflowType] = executor
-}
-
-// Close closes the database connection if it was opened by NewPoller.
-// If the poller was created with NewPollerWithDB, this is a no-op.
+// Close closes the database connection.
 func (p *Poller) Close() error {
-	if p.ownsDB && p.db != nil {
+	if p.db != nil {
 		return p.db.Close()
 	}
 	return nil
