@@ -10,25 +10,25 @@ class MetricsCollector(ABC):
     """Base metrics collector interface"""
 
     @abstractmethod
-    def record_intent_claimed(self, workflow_name: str, worker_id: str):
-        """Record when a worker claims an intent"""
+    def record_intent_claimed(self, workflow_type: str, worker_id: str):
+        """Record when a worker claims a workflow run"""
         pass
 
     @abstractmethod
     def record_intent_completed(
-        self, workflow_name: str, worker_id: str, status: str, duration: float
+        self, workflow_type: str, worker_id: str, status: str, duration: float
     ):
-        """Record when an intent execution completes (succeeded, failed, or deadletter)"""
+        """Record when a workflow run execution completes (succeeded, failed, or cancelled)"""
         pass
 
     @abstractmethod
-    def record_intent_deadletter(self, workflow_name: str, worker_id: str):
-        """Record when an intent is moved to deadletter status"""
+    def record_intent_deadletter(self, workflow_type: str, worker_id: str):
+        """Record when a workflow run permanently fails"""
         pass
 
     @abstractmethod
-    def record_failed_attempt(self, workflow_name: str, worker_id: str, attempt_number: int):
-        """Record individual workflow execution failures before deadletter"""
+    def record_failed_attempt(self, workflow_type: str, worker_id: str, attempt_number: int):
+        """Record individual workflow execution failures before permanent failure"""
         pass
 
     @abstractmethod
@@ -42,8 +42,8 @@ class MetricsCollector(ABC):
         pass
 
     @abstractmethod
-    def record_queue_depth(self, workflow_name: str, depth: int):
-        """Record the current queue depth for a workflow"""
+    def record_queue_depth(self, workflow_type: str, depth: int):
+        """Record the current queue depth for a workflow type"""
         pass
 
     @abstractmethod
@@ -61,35 +61,35 @@ class PrometheusMetrics(MetricsCollector):
     """Prometheus-based metrics collector"""
 
     def __init__(self):
-        # Intent metrics
-        self.intent_claimed_total = Counter(
-            "workflow_intent_claimed_total",
-            "Total workflow intents claimed",
-            ["workflow_name", "worker_id"],
+        # Workflow run metrics
+        self.run_claimed_total = Counter(
+            "workflow_run_claimed_total",
+            "Total workflow runs claimed",
+            ["workflow_type", "worker_id"],
         )
 
-        self.intent_completed_total = Counter(
-            "workflow_intent_completed_total",
-            "Total workflow intents completed",
-            ["workflow_name", "worker_id", "status"],
+        self.run_completed_total = Counter(
+            "workflow_run_completed_total",
+            "Total workflow runs completed",
+            ["workflow_type", "worker_id", "status"],
         )
 
-        self.intent_deadletter_total = Counter(
-            "workflow_intent_deadletter_total",
-            "Total workflow intents moved to deadletter",
-            ["workflow_name", "worker_id"],
+        self.run_failed_total = Counter(
+            "workflow_run_failed_total",
+            "Total workflow runs that permanently failed",
+            ["workflow_type", "worker_id"],
         )
 
-        self.intent_failed_attempts = Counter(
-            "workflow_intent_failed_attempts_total",
-            "Total failed workflow attempts before deadletter",
-            ["workflow_name", "worker_id", "attempt"],
+        self.run_failed_attempts = Counter(
+            "workflow_run_failed_attempts_total",
+            "Total failed workflow attempts before permanent failure",
+            ["workflow_type", "worker_id", "attempt"],
         )
 
-        self.intent_execution_duration = Histogram(
-            "workflow_intent_execution_duration_seconds",
-            "Workflow intent execution duration",
-            ["workflow_name", "worker_id", "status"],
+        self.run_execution_duration = Histogram(
+            "workflow_run_execution_duration_seconds",
+            "Workflow run execution duration",
+            ["workflow_type", "worker_id", "status"],
             buckets=[0.1, 0.5, 1, 5, 10, 30, 60, 300],
         )
 
@@ -107,9 +107,9 @@ class PrometheusMetrics(MetricsCollector):
         )
 
         self.queue_depth = Gauge(
-            "workflow_intent_queue_depth",
-            "Number of pending workflow intents",
-            ["workflow_name", "status"],
+            "workflow_run_queue_depth",
+            "Number of pending workflow runs",
+            ["workflow_type", "status"],
         )
 
         self.worker_uptime = Gauge(
@@ -126,28 +126,28 @@ class PrometheusMetrics(MetricsCollector):
 
         self.start_time = time.time()
 
-    def record_intent_claimed(self, workflow_name: str, worker_id: str):
-        self.intent_claimed_total.labels(
-            workflow_name=workflow_name, worker_id=worker_id
+    def record_intent_claimed(self, workflow_type: str, worker_id: str):
+        self.run_claimed_total.labels(
+            workflow_type=workflow_type, worker_id=worker_id
         ).inc()
 
     def record_intent_completed(
-        self, workflow_name: str, worker_id: str, status: str, duration: float
+        self, workflow_type: str, worker_id: str, status: str, duration: float
     ):
-        self.intent_completed_total.labels(
-            workflow_name=workflow_name, worker_id=worker_id, status=status
+        self.run_completed_total.labels(
+            workflow_type=workflow_type, worker_id=worker_id, status=status
         ).inc()
 
-        self.intent_execution_duration.labels(
-            workflow_name=workflow_name, worker_id=worker_id, status=status
+        self.run_execution_duration.labels(
+            workflow_type=workflow_type, worker_id=worker_id, status=status
         ).observe(duration)
 
-    def record_intent_deadletter(self, workflow_name: str, worker_id: str):
-        self.intent_deadletter_total.labels(
-            workflow_name=workflow_name, worker_id=worker_id
+    def record_intent_deadletter(self, workflow_type: str, worker_id: str):
+        self.run_failed_total.labels(
+            workflow_type=workflow_type, worker_id=worker_id
         ).inc()
 
-    def record_failed_attempt(self, workflow_name: str, worker_id: str, attempt_number: int):
+    def record_failed_attempt(self, workflow_type: str, worker_id: str, attempt_number: int):
         """Record individual failure attempts"""
         if attempt_number == 1:
             attempt_label = "1"
@@ -156,8 +156,8 @@ class PrometheusMetrics(MetricsCollector):
         else:
             attempt_label = "3+"
 
-        self.intent_failed_attempts.labels(
-            workflow_name=workflow_name,
+        self.run_failed_attempts.labels(
+            workflow_type=workflow_type,
             worker_id=worker_id,
             attempt=attempt_label
         ).inc()
@@ -172,8 +172,8 @@ class PrometheusMetrics(MetricsCollector):
     def record_poll_error(self, worker_id: str, error_type: str):
         self.poll_errors_total.labels(worker_id=worker_id, error_type=error_type).inc()
 
-    def record_queue_depth(self, workflow_name: str, depth: int):
-        self.queue_depth.labels(workflow_name=workflow_name, status="pending").set(
+    def record_queue_depth(self, workflow_type: str, depth: int):
+        self.queue_depth.labels(workflow_type=workflow_type, status="pending").set(
             depth
         )
 

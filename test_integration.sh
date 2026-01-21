@@ -48,7 +48,8 @@ query_db() {
 
 echo "1. Verifying Database Schema"
 echo "----------------------------"
-check_table "workflow_intent"
+check_table "workflow_run"
+check_table "workflow_event"
 check_table "workflow_registry"
 echo ""
 
@@ -57,42 +58,48 @@ echo "-----------------------------"
 query_db "SELECT workflow_name, runtime, is_enabled FROM workflow.workflow_registry ORDER BY workflow_name;"
 echo ""
 
-echo "3. Checking Workflow Intents"
-echo "---------------------------"
-INTENT_COUNT=$(query_db "SELECT COUNT(*) FROM workflow.workflow_intent WHERE deleted_at IS NULL;" -t | tr -d ' ')
-echo "Total active intents: $INTENT_COUNT"
-if [ "$INTENT_COUNT" -gt 0 ]; then
+echo "3. Checking Workflow Runs"
+echo "-------------------------"
+RUN_COUNT=$(query_db "SELECT COUNT(*) FROM workflow.workflow_run WHERE deleted_at IS NULL;" -t | tr -d ' ')
+echo "Total active workflow runs: $RUN_COUNT"
+if [ "$RUN_COUNT" -gt 0 ]; then
     echo ""
-    query_db "SELECT id, name, status, attempt_count, created_at FROM workflow.workflow_intent WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 10;"
+    query_db "SELECT id, type, status, attempt, created_at FROM workflow.workflow_run WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 10;"
 fi
 echo ""
 
-echo "4. Test: Create a Thumbnail Intent"
-echo "-----------------------------------"
+echo "4. Test: Create a Thumbnail Workflow Run"
+echo "-----------------------------------------"
 CONTENT_ID="test-$(date +%s)"
-echo "Creating intent for content_id: $CONTENT_ID"
+echo "Creating workflow run for content_id: $CONTENT_ID"
 
 query_db "
-INSERT INTO workflow.workflow_intent (name, payload, idempotency_key)
+INSERT INTO workflow.workflow_run (type, payload, idempotency_key)
 VALUES (
     'content.thumbnail.v1',
     '{\"content_id\": \"$CONTENT_ID\", \"width\": 300, \"height\": 300}'::jsonb,
     'test:thumbnail:$CONTENT_ID:300x300'
 )
-RETURNING id, name, status;
+RETURNING id, type, status;
 "
 echo ""
 
-echo "5. Verify Intent Created"
+echo "5. Verify Workflow Run Created"
+echo "-------------------------------"
+query_db "SELECT id, type, status, payload, deleted_at FROM workflow.workflow_run WHERE payload->>'content_id' = '$CONTENT_ID';"
+echo ""
+
+echo "6. Check Workflow Events"
 echo "------------------------"
-query_db "SELECT id, name, status, payload, deleted_at FROM workflow.workflow_intent WHERE payload->>'content_id' = '$CONTENT_ID';"
+query_db "SELECT event_type, COUNT(*) as count FROM workflow.workflow_event GROUP BY event_type ORDER BY count DESC;"
 echo ""
 
 echo "=================================================="
 echo "Integration test complete!"
 echo ""
 echo "Next steps:"
-echo "1. Start pipeline-worker to process thumbnail intents"
+echo "1. Start pipeline-worker to process thumbnail workflow runs"
 echo "2. Upload an image via PAS API to trigger automatic thumbnail generation"
-echo "3. Verify intents are claimed and executed"
+echo "3. Verify workflow runs are claimed and executed"
+echo "4. Check workflow_event table for audit trail"
 echo "=================================================="

@@ -10,18 +10,18 @@ import (
 // MetricsCollector interface allows optional metrics collection
 // Implementations can track workflow execution metrics for observability
 type MetricsCollector interface {
-	// RecordIntentClaimed tracks when a workflow intent is claimed by a worker
-	RecordIntentClaimed(workflowName, workerID string)
+	// RecordIntentClaimed tracks when a workflow run is claimed by a worker
+	RecordIntentClaimed(workflowType, workerID string)
 
 	// RecordIntentCompleted tracks workflow completion with status and duration
-	// Status can be: "succeeded", "failed", "deadletter"
-	RecordIntentCompleted(workflowName, workerID, status string, duration time.Duration)
+	// Status can be: "succeeded", "failed", "cancelled"
+	RecordIntentCompleted(workflowType, workerID, status string, duration time.Duration)
 
-	// RecordIntentDeadletter tracks workflows moved to deadletter queue (PRIORITY METRIC)
-	RecordIntentDeadletter(workflowName, workerID string)
+	// RecordIntentDeadletter tracks workflows that permanently failed (PRIORITY METRIC)
+	RecordIntentDeadletter(workflowType, workerID string)
 
-	// RecordFailedAttempt tracks individual workflow execution failures before deadletter
-	RecordFailedAttempt(workflowName, workerID string, attemptNumber int)
+	// RecordFailedAttempt tracks individual workflow execution failures before permanent failure
+	RecordFailedAttempt(workflowType, workerID string, attemptNumber int)
 
 	// RecordPollCycle tracks polling activity
 	RecordPollCycle(workerID string)
@@ -30,17 +30,17 @@ type MetricsCollector interface {
 	RecordPollError(workerID string, errorType string)
 
 	// RecordQueueDepth updates the current queue depth gauge
-	RecordQueueDepth(workflowName string, status string, depth int)
+	RecordQueueDepth(workflowType string, status string, depth int)
 }
 
 // PrometheusMetrics implements MetricsCollector using Prometheus
 type PrometheusMetrics struct {
-	// Intent metrics
-	intentClaimedTotal      *prometheus.CounterVec
-	intentCompletedTotal    *prometheus.CounterVec
-	intentDeadletterTotal   *prometheus.CounterVec
-	intentFailedAttempts    *prometheus.CounterVec
-	intentExecutionDuration *prometheus.HistogramVec
+	// Workflow run metrics
+	runClaimedTotal      *prometheus.CounterVec
+	runCompletedTotal    *prometheus.CounterVec
+	runFailedTotal       *prometheus.CounterVec
+	runFailedAttempts    *prometheus.CounterVec
+	runExecutionDuration *prometheus.HistogramVec
 
 	// Worker metrics
 	pollCycleTotal  *prometheus.CounterVec
@@ -62,50 +62,50 @@ func NewPrometheusMetrics(registry prometheus.Registerer) *PrometheusMetrics {
 	factory := promauto.With(registry)
 
 	metrics := &PrometheusMetrics{
-		// Intent claimed counter
-		intentClaimedTotal: factory.NewCounterVec(
+		// Workflow run claimed counter
+		runClaimedTotal: factory.NewCounterVec(
 			prometheus.CounterOpts{
-				Name: "workflow_intent_claimed_total",
-				Help: "Total number of workflow intents claimed by workers",
+				Name: "workflow_run_claimed_total",
+				Help: "Total number of workflow runs claimed by workers",
 			},
-			[]string{"workflow_name", "worker_id"},
+			[]string{"workflow_type", "worker_id"},
 		),
 
-		// Intent completed counter
-		intentCompletedTotal: factory.NewCounterVec(
+		// Workflow run completed counter
+		runCompletedTotal: factory.NewCounterVec(
 			prometheus.CounterOpts{
-				Name: "workflow_intent_completed_total",
-				Help: "Total number of workflow intents completed (succeeded/failed/deadletter)",
+				Name: "workflow_run_completed_total",
+				Help: "Total number of workflow runs completed (succeeded/failed/cancelled)",
 			},
-			[]string{"workflow_name", "worker_id", "status"},
+			[]string{"workflow_type", "worker_id", "status"},
 		),
 
-		// Deadletter counter (PRIORITY METRIC for alerting)
-		intentDeadletterTotal: factory.NewCounterVec(
+		// Failed counter (PRIORITY METRIC for alerting)
+		runFailedTotal: factory.NewCounterVec(
 			prometheus.CounterOpts{
-				Name: "workflow_intent_deadletter_total",
-				Help: "Total number of workflow intents moved to deadletter queue",
+				Name: "workflow_run_failed_total",
+				Help: "Total number of workflow runs that permanently failed",
 			},
-			[]string{"workflow_name", "worker_id"},
+			[]string{"workflow_type", "worker_id"},
 		),
 
-		// Failed attempts counter (tracks failures before deadletter)
-		intentFailedAttempts: factory.NewCounterVec(
+		// Failed attempts counter (tracks failures before permanent failure)
+		runFailedAttempts: factory.NewCounterVec(
 			prometheus.CounterOpts{
-				Name: "workflow_intent_failed_attempts_total",
-				Help: "Total number of failed workflow attempts (before deadletter)",
+				Name: "workflow_run_failed_attempts_total",
+				Help: "Total number of failed workflow attempts (before permanent failure)",
 			},
-			[]string{"workflow_name", "worker_id", "attempt"},
+			[]string{"workflow_type", "worker_id", "attempt"},
 		),
 
 		// Execution duration histogram (P50, P95, P99)
-		intentExecutionDuration: factory.NewHistogramVec(
+		runExecutionDuration: factory.NewHistogramVec(
 			prometheus.HistogramOpts{
-				Name:    "workflow_intent_execution_duration_seconds",
-				Help:    "Workflow intent execution duration in seconds",
+				Name:    "workflow_run_execution_duration_seconds",
+				Help:    "Workflow run execution duration in seconds",
 				Buckets: []float64{0.1, 0.5, 1, 5, 10, 30, 60, 300}, // 100ms to 5min
 			},
-			[]string{"workflow_name", "worker_id", "status"},
+			[]string{"workflow_type", "worker_id", "status"},
 		),
 
 		// Poll cycle counter
@@ -129,10 +129,10 @@ func NewPrometheusMetrics(registry prometheus.Registerer) *PrometheusMetrics {
 		// Queue depth gauge
 		queueDepth: factory.NewGaugeVec(
 			prometheus.GaugeOpts{
-				Name: "workflow_intent_queue_depth",
-				Help: "Number of workflow intents in queue by status",
+				Name: "workflow_run_queue_depth",
+				Help: "Number of workflow runs in queue by status",
 			},
-			[]string{"workflow_name", "status"},
+			[]string{"workflow_type", "status"},
 		),
 
 		// Worker uptime gauge
@@ -160,30 +160,30 @@ func NewPrometheusMetrics(registry prometheus.Registerer) *PrometheusMetrics {
 }
 
 // RecordIntentClaimed increments the claimed counter
-func (m *PrometheusMetrics) RecordIntentClaimed(workflowName, workerID string) {
-	m.intentClaimedTotal.WithLabelValues(workflowName, workerID).Inc()
+func (m *PrometheusMetrics) RecordIntentClaimed(workflowType, workerID string) {
+	m.runClaimedTotal.WithLabelValues(workflowType, workerID).Inc()
 }
 
 // RecordIntentCompleted tracks workflow completion with status and duration
-func (m *PrometheusMetrics) RecordIntentCompleted(workflowName, workerID, status string, duration time.Duration) {
-	m.intentCompletedTotal.WithLabelValues(workflowName, workerID, status).Inc()
-	m.intentExecutionDuration.WithLabelValues(workflowName, workerID, status).Observe(duration.Seconds())
+func (m *PrometheusMetrics) RecordIntentCompleted(workflowType, workerID, status string, duration time.Duration) {
+	m.runCompletedTotal.WithLabelValues(workflowType, workerID, status).Inc()
+	m.runExecutionDuration.WithLabelValues(workflowType, workerID, status).Observe(duration.Seconds())
 }
 
-// RecordIntentDeadletter increments the deadletter counter (CRITICAL for alerts)
-func (m *PrometheusMetrics) RecordIntentDeadletter(workflowName, workerID string) {
-	m.intentDeadletterTotal.WithLabelValues(workflowName, workerID).Inc()
+// RecordIntentDeadletter increments the failed counter (CRITICAL for alerts)
+func (m *PrometheusMetrics) RecordIntentDeadletter(workflowType, workerID string) {
+	m.runFailedTotal.WithLabelValues(workflowType, workerID).Inc()
 }
 
 // RecordFailedAttempt tracks individual failure attempts
-func (m *PrometheusMetrics) RecordFailedAttempt(workflowName, workerID string, attemptNumber int) {
+func (m *PrometheusMetrics) RecordFailedAttempt(workflowType, workerID string, attemptNumber int) {
 	attemptLabel := "1"
 	if attemptNumber == 2 {
 		attemptLabel = "2"
 	} else if attemptNumber >= 3 {
 		attemptLabel = "3+"
 	}
-	m.intentFailedAttempts.WithLabelValues(workflowName, workerID, attemptLabel).Inc()
+	m.runFailedAttempts.WithLabelValues(workflowType, workerID, attemptLabel).Inc()
 }
 
 // RecordPollCycle increments poll cycle counter and updates worker health gauges
@@ -199,6 +199,6 @@ func (m *PrometheusMetrics) RecordPollError(workerID string, errorType string) {
 }
 
 // RecordQueueDepth sets the current queue depth gauge
-func (m *PrometheusMetrics) RecordQueueDepth(workflowName string, status string, depth int) {
-	m.queueDepth.WithLabelValues(workflowName, status).Set(float64(depth))
+func (m *PrometheusMetrics) RecordQueueDepth(workflowType string, status string, depth int) {
+	m.queueDepth.WithLabelValues(workflowType, status).Set(float64(depth))
 }

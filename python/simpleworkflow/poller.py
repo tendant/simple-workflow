@@ -1,10 +1,11 @@
 """
-Intent Poller for Python Workers
-Polls workflow_intent table and executes Python workflows
+Workflow Run Poller for Python Workers
+Polls workflow_run table and executes Python workflows
 """
 
 import json
 import logging
+import random
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
@@ -18,6 +19,40 @@ from .metrics import MetricsCollector
 logger = logging.getLogger(__name__)
 
 
+class WorkflowRun:
+    """Represents a claimed workflow run with heartbeat and cancellation support"""
+
+    def __init__(
+        self,
+        run_id: str,
+        workflow_type: str,
+        payload: bytes,
+        attempt: int,
+        max_attempts: int,
+        db_url: str,
+        search_path: str,
+        heartbeat_fn: Callable[[int], None],
+        is_cancelled_fn: Callable[[], bool],
+    ):
+        self.id = run_id
+        self.type = workflow_type
+        self.payload = payload
+        self.attempt = attempt
+        self.max_attempts = max_attempts
+        self._db_url = db_url
+        self._search_path = search_path
+        self._heartbeat_fn = heartbeat_fn
+        self._is_cancelled_fn = is_cancelled_fn
+
+    def heartbeat(self, duration_seconds: int = 30):
+        """Extend the lease on this workflow run"""
+        self._heartbeat_fn(duration_seconds)
+
+    def is_cancelled(self) -> bool:
+        """Check if this workflow run has been cancelled"""
+        return self._is_cancelled_fn()
+
+
 class WorkflowExecutor(ABC):
     """
     Base class for workflow executors.
@@ -25,12 +60,13 @@ class WorkflowExecutor(ABC):
     """
 
     @abstractmethod
-    def execute(self, intent: Dict[str, Any]) -> Any:
+    def execute(self, run: WorkflowRun) -> Any:
         """
-        Execute a workflow intent and return the result.
+        Execute a workflow run and return the result.
 
         Args:
-            intent: Dict containing 'id', 'name', 'payload', 'attempt_count', 'max_attempts'
+            run: WorkflowRun object containing id, type, payload, attempt, max_attempts,
+                 plus heartbeat() and is_cancelled() methods
 
         Returns:
             Any result that can be JSON-serialized
@@ -42,24 +78,26 @@ class WorkflowExecutor(ABC):
 
 
 class IntentPoller:
-    """Polls workflow_intent table and executes Python workflows"""
+    """Polls workflow_run table and executes Python workflows"""
 
     def __init__(
         self,
         db_url: str,
-        supported_workflows: list[str],
+        type_prefixes: list[str],
         worker_id: str = "python-worker",
         poll_interval: int = 2,
+        lease_duration: int = 30,
         metrics: Optional[MetricsCollector] = None,
     ):
         """
-        Initialize the intent poller.
+        Initialize the workflow run poller.
 
         Args:
             db_url: PostgreSQL connection string (may include search_path= query parameter)
-            supported_workflows: List of workflow names this poller handles
+            type_prefixes: List of type prefixes this poller handles (e.g., ["billing.%", "media.%"])
             worker_id: Unique identifier for this worker (default: "python-worker")
             poll_interval: Polling interval in seconds (default: 2)
+            lease_duration: Lease duration in seconds (default: 30)
             metrics: Optional metrics collector for observability
         """
         # Parse URL to extract and remove search_path (psycopg2 doesn't support it as query param)
@@ -80,9 +118,10 @@ class IntentPoller:
             self.db_url = db_url
             self.search_path = 'public'
 
-        self.supported_workflows = supported_workflows
+        self.type_prefixes = type_prefixes
         self.worker_id = worker_id
         self.poll_interval = poll_interval
+        self.lease_duration = lease_duration
         self.running = False
         self.executors: Dict[str, WorkflowExecutor] = {}
         self.metrics = metrics
@@ -94,16 +133,16 @@ class IntentPoller:
         else:
             logger.warning("Metrics collector is None - metrics will not be recorded")
 
-    def register_executor(self, workflow_name: str, executor: WorkflowExecutor):
+    def register_executor(self, workflow_type: str, executor: WorkflowExecutor):
         """
-        Register a workflow executor for a specific workflow name.
+        Register a workflow executor for a specific workflow type.
 
         Args:
-            workflow_name: Workflow name (e.g., "myapp.process.v1")
+            workflow_type: Workflow type (e.g., "myapp.process.v1")
             executor: WorkflowExecutor instance that handles this workflow
         """
-        self.executors[workflow_name] = executor
-        logger.info(f"Registered executor for workflow: {workflow_name}")
+        self.executors[workflow_type] = executor
+        logger.info(f"Registered executor for workflow type: {workflow_type}")
 
     def _connect(self):
         """Create a database connection and set search_path"""
@@ -118,7 +157,7 @@ class IntentPoller:
         """Start polling loop (blocking)"""
         self.running = True
         logger.info(
-            f"Intent poller started, watching workflows: {self.supported_workflows}"
+            f"Workflow poller started, watching type prefixes: {self.type_prefixes}"
         )
         logger.info(f"Worker ID: {self.worker_id}")
 
@@ -133,7 +172,7 @@ class IntentPoller:
     def stop(self):
         """Stop polling"""
         self.running = False
-        logger.info("Intent poller stopped")
+        logger.info("Workflow poller stopped")
 
     def poll_and_execute(self):
         """Poll for work and execute if found"""
@@ -150,7 +189,7 @@ class IntentPoller:
         execution_start = time.time()
 
         try:
-            intent = self.claim_intent()
+            run = self.claim_run()
         except Exception as e:
             if self.metrics:
                 try:
@@ -160,7 +199,7 @@ class IntentPoller:
                     logger.error(f"Error recording poll error metric: {me}", exc_info=True)
             raise
 
-        if intent is None:
+        if run is None:
             # No work available - update queue depth metrics
             if self.metrics:
                 try:
@@ -169,72 +208,98 @@ class IntentPoller:
                     logger.error(f"Error updating queue depth: {e}", exc_info=True)
             return
 
-        # Record intent claimed
-        logger.info(f"Claimed intent: {intent['id']} (name: {intent['name']})")
+        # Record run claimed
+        logger.info(f"Claimed workflow run: {run.id} (type: {run.type})")
         if self.metrics:
             try:
-                self.metrics.record_intent_claimed(intent["name"], self.worker_id)
-                logger.info(f"DEBUG: Recorded intent_claimed metric for {intent['name']}")
+                self.metrics.record_intent_claimed(run.type, self.worker_id)
+                logger.info(f"DEBUG: Recorded intent_claimed metric for {run.type}")
             except Exception as e:
                 logger.error(f"Error recording intent_claimed metric: {e}", exc_info=True)
 
+        # Log started event
+        self._log_event(run.id, "started", {"worker_id": self.worker_id})
+
         try:
-            result = self.execute_intent(intent)
-            self.mark_succeeded(intent["id"], intent["name"], result, execution_start)
+            result = self.execute_run(run)
+            self.mark_succeeded(run.id, run.type, result, execution_start)
         except Exception as e:
-            logger.error(f"Intent {intent['id']} failed: {e}", exc_info=True)
+            logger.error(f"Workflow run {run.id} failed: {e}", exc_info=True)
             self.mark_failed(
-                intent["id"],
-                intent["name"],
-                intent["attempt_count"],
-                intent["max_attempts"],
+                run.id,
+                run.type,
+                run.attempt,
+                run.max_attempts,
                 str(e),
                 execution_start,
             )
 
-    def claim_intent(self) -> Optional[Dict[str, Any]]:
-        """Claim a pending intent using SELECT FOR UPDATE SKIP LOCKED"""
+    def claim_run(self) -> Optional[WorkflowRun]:
+        """Claim a pending workflow run using SELECT FOR UPDATE SKIP LOCKED"""
         conn = None
         try:
             conn = self._connect()
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Claim intent
-                cur.execute(
-                    """
-                    SELECT id, name, payload, attempt_count, max_attempts
-                    FROM workflow_intent
+                # Build WHERE clause for type-prefix matching
+                where_clauses = " AND (" + " OR ".join(
+                    f"type LIKE '{prefix}'" for prefix in self.type_prefixes
+                ) + ")" if self.type_prefixes else ""
+
+                # Claim workflow run
+                query = f"""
+                    SELECT id, type, payload, attempt, max_attempts
+                    FROM workflow_run
                     WHERE status = 'pending'
-                      AND name = ANY(%s)
-                      AND run_after <= NOW()
+                      AND run_at <= NOW()
                       AND deleted_at IS NULL
+                      {where_clauses}
                     ORDER BY priority ASC, created_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
-                """,
-                    (self.supported_workflows,),
-                )
+                """
+                cur.execute(query)
 
-                intent = cur.fetchone()
-                if intent is None:
+                row = cur.fetchone()
+                if row is None:
                     return None
 
-                # Mark as running
+                # Mark as leased
                 cur.execute(
                     """
-                    UPDATE workflow_intent
-                    SET status = 'running',
-                        claimed_by = %s,
-                        lease_expires_at = NOW() + INTERVAL '5 minutes',
+                    UPDATE workflow_run
+                    SET status = 'leased',
+                        leased_by = %s,
+                        lease_until = NOW() + INTERVAL '%s seconds',
                         updated_at = NOW()
                     WHERE id = %s
                 """,
-                    (self.worker_id, intent["id"]),
+                    (self.worker_id, self.lease_duration, row["id"]),
                 )
 
                 conn.commit()
-                return dict(intent)
+
+                # Create WorkflowRun object with heartbeat and cancellation functions
+                run = WorkflowRun(
+                    run_id=row["id"],
+                    workflow_type=row["type"],
+                    payload=row["payload"],
+                    attempt=row["attempt"],
+                    max_attempts=row["max_attempts"],
+                    db_url=self.db_url,
+                    search_path=self.search_path,
+                    heartbeat_fn=lambda duration: self._heartbeat(row["id"], duration),
+                    is_cancelled_fn=lambda: self._is_cancelled(row["id"]),
+                )
+
+                # Log leased event
+                self._log_event(row["id"], "leased", {
+                    "worker_id": self.worker_id,
+                    "attempt": row["attempt"],
+                })
+
+                return run
         except Exception as e:
-            logger.error(f"Error claiming intent: {e}", exc_info=True)
+            logger.error(f"Error claiming workflow run: {e}", exc_info=True)
             if conn:
                 conn.rollback()
             return None
@@ -242,57 +307,60 @@ class IntentPoller:
             if conn:
                 conn.close()
 
-    def execute_intent(self, intent: Dict[str, Any]) -> Any:
+    def execute_run(self, run: WorkflowRun) -> Any:
         """Execute workflow based on registered executor"""
-        workflow_name = intent["name"]
+        workflow_type = run.type
 
         # Find registered executor
-        executor = self.executors.get(workflow_name)
+        executor = self.executors.get(workflow_type)
         if executor is None:
             raise ValueError(
-                f"No executor registered for workflow: {workflow_name}. "
+                f"No executor registered for workflow type: {workflow_type}. "
                 f"Available executors: {list(self.executors.keys())}"
             )
 
         # Execute workflow
-        logger.info(f"Executing workflow: {workflow_name}")
-        result = executor.execute(intent)
+        logger.info(f"Executing workflow type: {workflow_type}")
+        result = executor.execute(run)
         return result
 
     def mark_succeeded(
-        self, intent_id: str, workflow_name: str, result: Any, execution_start: float
+        self, run_id: str, workflow_type: str, result: Any, execution_start: float
     ):
-        """Mark intent as succeeded"""
+        """Mark workflow run as succeeded"""
         conn = None
         try:
             conn = self._connect()
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE workflow_intent
+                    UPDATE workflow_run
                     SET status = 'succeeded',
                         result = %s,
                         updated_at = NOW()
                     WHERE id = %s
                 """,
-                    (json.dumps(result), intent_id),
+                    (json.dumps(result), run_id),
                 )
                 conn.commit()
-                logger.info(f"Intent {intent_id} succeeded")
+                logger.info(f"Workflow run {run_id} succeeded")
+
+                # Log succeeded event
+                self._log_event(run_id, "succeeded", None)
 
                 # Record metrics
                 if self.metrics:
                     try:
                         duration = time.time() - execution_start
                         self.metrics.record_intent_completed(
-                            workflow_name, self.worker_id, "succeeded", duration
+                            workflow_type, self.worker_id, "succeeded", duration
                         )
-                        logger.info(f"DEBUG: Recorded intent_completed metric (succeeded) for {workflow_name}, duration={duration:.3f}s")
+                        logger.info(f"DEBUG: Recorded intent_completed metric (succeeded) for {workflow_type}, duration={duration:.3f}s")
                     except Exception as e:
                         logger.error(f"Error recording intent_completed metric: {e}", exc_info=True)
         except Exception as e:
             logger.error(
-                f"Error marking intent {intent_id} as succeeded: {e}", exc_info=True
+                f"Error marking workflow run {run_id} as succeeded: {e}", exc_info=True
             )
             if conn:
                 conn.rollback()
@@ -302,20 +370,21 @@ class IntentPoller:
 
     def mark_failed(
         self,
-        intent_id: str,
-        workflow_name: str,
-        attempt_count: int,
+        run_id: str,
+        workflow_type: str,
+        attempt: int,
         max_attempts: int,
         error: str,
         execution_start: float,
     ):
-        """Mark intent as failed with retry logic"""
-        new_attempt_count = attempt_count + 1
-        status = "pending" if new_attempt_count < max_attempts else "deadletter"
+        """Mark workflow run as failed with retry logic"""
+        new_attempt = attempt + 1
+        status = "pending" if new_attempt < max_attempts else "failed"
 
-        # Exponential backoff
-        backoff_minutes = new_attempt_count**2
-        run_after = datetime.now() + timedelta(minutes=backoff_minutes)
+        # Exponential backoff with jitter (prevents thundering herd)
+        base_delay_minutes = new_attempt ** 2
+        jitter_minutes = base_delay_minutes * 0.1 * random.random()
+        run_at = datetime.now() + timedelta(minutes=base_delay_minutes + jitter_minutes)
 
         conn = None
         try:
@@ -323,20 +392,27 @@ class IntentPoller:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE workflow_intent
+                    UPDATE workflow_run
                     SET status = %s,
-                        attempt_count = %s,
-                        run_after = %s,
+                        attempt = %s,
+                        run_at = %s,
                         last_error = %s,
                         updated_at = NOW()
                     WHERE id = %s
                 """,
-                    (status, new_attempt_count, run_after, error, intent_id),
+                    (status, new_attempt, run_at, error, run_id),
                 )
                 conn.commit()
                 logger.info(
-                    f"Intent {intent_id} failed (attempt {new_attempt_count}/{max_attempts})"
+                    f"Workflow run {run_id} failed (attempt {new_attempt}/{max_attempts})"
                 )
+
+                # Log event
+                event_type = "retried" if status == "pending" else "failed"
+                self._log_event(run_id, event_type, {
+                    "attempt": new_attempt,
+                    "error": error,
+                })
 
                 # Record metrics
                 if self.metrics:
@@ -345,26 +421,26 @@ class IntentPoller:
 
                         # Record failed attempt
                         self.metrics.record_failed_attempt(
-                            workflow_name, self.worker_id, new_attempt_count
+                            workflow_type, self.worker_id, new_attempt
                         )
 
                         # Record completion status
                         self.metrics.record_intent_completed(
-                            workflow_name, self.worker_id, status, duration
+                            workflow_type, self.worker_id, status, duration
                         )
-                        logger.info(f"DEBUG: Recorded intent_completed metric ({status}) for {workflow_name}, duration={duration:.3f}s")
+                        logger.info(f"DEBUG: Recorded intent_completed metric ({status}) for {workflow_type}, duration={duration:.3f}s")
 
-                        # Record deadletter metric if workflow permanently failed
-                        if status == "deadletter":
+                        # Record failed metric if workflow permanently failed
+                        if status == "failed":
                             self.metrics.record_intent_deadletter(
-                                workflow_name, self.worker_id
+                                workflow_type, self.worker_id
                             )
-                            logger.info(f"DEBUG: Recorded intent_deadletter metric for {workflow_name}")
+                            logger.info(f"DEBUG: Recorded intent_deadletter metric for {workflow_type}")
                     except Exception as e:
                         logger.error(f"Error recording metrics in mark_failed: {e}", exc_info=True)
         except Exception as e:
             logger.error(
-                f"Error marking intent {intent_id} as failed: {e}", exc_info=True
+                f"Error marking workflow run {run_id} as failed: {e}", exc_info=True
             )
             if conn:
                 conn.rollback()
@@ -373,7 +449,7 @@ class IntentPoller:
                 conn.close()
 
     def _update_queue_depth(self):
-        """Update queue depth metrics for all supported workflows"""
+        """Update queue depth metrics for all type prefixes"""
         if not self.metrics:
             return
 
@@ -381,19 +457,91 @@ class IntentPoller:
         try:
             conn = self._connect()
             with conn.cursor() as cur:
-                for workflow_name in self.supported_workflows:
+                for prefix in self.type_prefixes:
                     cur.execute(
                         """
                         SELECT COUNT(*)
-                        FROM workflow_intent
-                        WHERE name = %s AND status = 'pending' AND deleted_at IS NULL
+                        FROM workflow_run
+                        WHERE type LIKE %s AND status = 'pending' AND deleted_at IS NULL
                     """,
-                        (workflow_name,),
+                        (prefix,),
                     )
                     depth = cur.fetchone()[0]
-                    self.metrics.record_queue_depth(workflow_name, depth)
+                    self.metrics.record_queue_depth(prefix, depth)
         except Exception as e:
             logger.error(f"Error updating queue depth: {e}", exc_info=True)
+        finally:
+            if conn:
+                conn.close()
+
+    def _heartbeat(self, run_id: str, duration_seconds: int):
+        """Extend the lease on a workflow run"""
+        conn = None
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE workflow_run
+                    SET lease_until = NOW() + INTERVAL '%s seconds',
+                        updated_at = NOW()
+                    WHERE id = %s AND status = 'leased'
+                """,
+                    (duration_seconds, run_id),
+                )
+                conn.commit()
+
+                # Log heartbeat event
+                self._log_event(run_id, "heartbeat", {
+                    "extended_by_seconds": duration_seconds,
+                })
+        except Exception as e:
+            logger.error(f"Error extending lease for {run_id}: {e}", exc_info=True)
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
+
+    def _is_cancelled(self, run_id: str) -> bool:
+        """Check if a workflow run has been cancelled"""
+        conn = None
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM workflow_run WHERE id = %s",
+                    (run_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row[0] == "cancelled"
+                return False
+        except Exception as e:
+            logger.error(f"Error checking cancellation for {run_id}: {e}", exc_info=True)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def _log_event(self, workflow_id: str, event_type: str, data: Optional[Dict[str, Any]]):
+        """Log an audit event (best-effort, errors are ignored)"""
+        conn = None
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                data_json = json.dumps(data) if data else None
+                cur.execute(
+                    """
+                    INSERT INTO workflow_event (workflow_id, event_type, data)
+                    VALUES (%s, %s, %s)
+                """,
+                    (workflow_id, event_type, data_json),
+                )
+                conn.commit()
+        except Exception:
+            # Silently ignore event logging errors
+            pass
         finally:
             if conn:
                 conn.close()
