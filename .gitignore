@@ -61,3 +61,7 @@ env/
 # .vscode/
 
 .claude/
+
+# Example compiled binaries
+examples/go/basic_worker
+examples/go/billing_worker
