@@ -108,6 +108,29 @@ Notes:
 
 ## Database Schema (Minimal & Stable)
 
+### Soft delete policy
+
+This design supports **soft deletes** for operational safety and auditability.
+
+- Soft delete is represented by `deleted_at IS NOT NULL`.
+- Soft-deleted runs are **never leased or executed**.
+- Soft-deleted rows may be retained for audit/debugging and later hard-deleted by a separate retention job.
+
+Recommended operation:
+
+```sql
+UPDATE workflow_run
+SET deleted_at = now(),
+    delete_reason = $reason
+WHERE id = $id;
+```
+
+Notes:
+- Soft delete is orthogonal to `status`. A run can be soft-deleted regardless of current status.
+- If you soft-delete a `leased` run, it will stop being re-leased; the currently running worker may still finish unless you also `cancel` it (cooperative).
+
+
+
 ### `workflow_run`
 
 ```sql
@@ -135,6 +158,10 @@ CREATE TABLE workflow_run (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
 
+  -- Soft delete
+  deleted_at        TIMESTAMPTZ,
+  delete_reason     TEXT,
+
   CONSTRAINT workflow_run_status_check
     CHECK (status IN ('pending', 'leased', 'succeeded', 'failed', 'cancelled'))
 );
@@ -155,16 +182,19 @@ EXECUTE FUNCTION set_updated_at();
 
 CREATE UNIQUE INDEX IF NOT EXISTS workflow_run_idempotency_idx
   ON workflow_run(idempotency_key)
-  WHERE idempotency_key IS NOT NULL;
+  WHERE idempotency_key IS NOT NULL
+    AND deleted_at IS NULL;
 
 -- General polling (filters by status/run_at, then orders by priority)
 CREATE INDEX workflow_run_poll_idx
-  ON workflow_run(status, run_at, priority DESC, lease_until);
+  ON workflow_run(status, run_at, priority DESC, lease_until)
+  WHERE deleted_at IS NULL;
 
 -- If you want workers to poll specific type prefixes efficiently
 -- Note: for `LIKE 'prefix.%'`, consider `text_pattern_ops` and verify with EXPLAIN ANALYZE
 CREATE INDEX workflow_run_type_poll_idx
-  ON workflow_run(type text_pattern_ops, status, run_at, priority DESC, lease_until);
+  ON workflow_run(type text_pattern_ops, status, run_at, priority DESC, lease_until)
+  WHERE deleted_at IS NULL;
 ```
 
 #### Notes
@@ -299,6 +329,7 @@ WHERE id = (
   SELECT id
   FROM workflow_run
   WHERE status IN ('pending', 'leased')
+    AND deleted_at IS NULL
     AND run_at <= now()
     AND (lease_until IS NULL OR lease_until < now())
     AND (
