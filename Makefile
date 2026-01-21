@@ -13,10 +13,11 @@ DB_USER ?= postgres
 DB_PASSWORD ?= postgres
 DB_NAME ?= workflow
 DB_SSLMODE ?= disable
+DB_SCHEMA ?= workflow
 
 # Goose configuration
 MIGRATIONS_DIR = migrations
-DB_URL = "host=$(DB_HOST) port=$(DB_PORT) user=$(DB_USER) password=$(DB_PASSWORD) dbname=$(DB_NAME) sslmode=$(DB_SSLMODE) search_path=workflow"
+DB_URL = "host=$(DB_HOST) port=$(DB_PORT) user=$(DB_USER) password=$(DB_PASSWORD) dbname=$(DB_NAME) sslmode=$(DB_SSLMODE) search_path=$(DB_SCHEMA)"
 
 help:
 	@echo "Simple-Workflow Makefile"

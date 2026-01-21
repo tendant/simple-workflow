@@ -149,7 +149,7 @@ func (p *Poller) claimRun(ctx context.Context) (*WorkflowRun, error) {
 	// Claim using SELECT FOR UPDATE SKIP LOCKED
 	query := fmt.Sprintf(`
 		SELECT id, type, payload, attempt, max_attempts
-		FROM workflow.workflow_run
+		FROM workflow_run
 		WHERE status = 'pending'
 		  AND run_at <= NOW()
 		  AND deleted_at IS NULL
@@ -173,7 +173,7 @@ func (p *Poller) claimRun(ctx context.Context) (*WorkflowRun, error) {
 
 	// Mark as leased
 	updateQuery := `
-		UPDATE workflow.workflow_run
+		UPDATE workflow_run
 		SET status = 'leased',
 			leased_by = $1,
 			lease_until = NOW() + $2::interval,
@@ -232,7 +232,7 @@ func (p *Poller) markRunSucceeded(ctx context.Context, run *WorkflowRun, result 
 	resultJSON, _ := json.Marshal(result)
 
 	query := `
-		UPDATE workflow.workflow_run
+		UPDATE workflow_run
 		SET status = 'succeeded',
 			result = $1,
 			updated_at = NOW()
@@ -269,7 +269,7 @@ func (p *Poller) markRunFailed(ctx context.Context, run *WorkflowRun, execErr er
 	}
 
 	query := `
-		UPDATE workflow.workflow_run
+		UPDATE workflow_run
 		SET status = $1,
 			attempt = $2,
 			run_at = $3,
@@ -320,7 +320,7 @@ func (p *Poller) updateQueueDepth(ctx context.Context) {
 	for _, prefix := range p.typePrefixes {
 		var depth int
 		err := p.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM workflow.workflow_run
+			`SELECT COUNT(*) FROM workflow_run
 			 WHERE type LIKE $1 AND status = 'pending' AND deleted_at IS NULL`,
 			prefix,
 		).Scan(&depth)
@@ -335,7 +335,7 @@ func (p *Poller) updateQueueDepth(ctx context.Context) {
 func (p *Poller) makeHeartbeatFunc(runID string) HeartbeatFunc {
 	return func(ctx context.Context, duration time.Duration) error {
 		query := `
-			UPDATE workflow.workflow_run
+			UPDATE workflow_run
 			SET lease_until = NOW() + $1::interval,
 				updated_at = NOW()
 			WHERE id = $2 AND status = 'leased'
@@ -368,7 +368,7 @@ func (p *Poller) makeHeartbeatFunc(runID string) HeartbeatFunc {
 func (p *Poller) makeCancellationCheckFunc(runID string) CancellationCheckFunc {
 	return func(ctx context.Context) (bool, error) {
 		var status string
-		query := `SELECT status FROM workflow.workflow_run WHERE id = $1`
+		query := `SELECT status FROM workflow_run WHERE id = $1`
 		err := p.db.QueryRowContext(ctx, query, runID).Scan(&status)
 		if err != nil {
 			return false, fmt.Errorf("failed to check cancellation status: %w", err)
@@ -389,7 +389,7 @@ func (p *Poller) logEvent(ctx context.Context, workflowID, eventType string, dat
 	}
 
 	query := `
-		INSERT INTO workflow.workflow_event (workflow_id, event_type, data)
+		INSERT INTO workflow_event (workflow_id, event_type, data)
 		VALUES ($1, $2, $3)
 	`
 

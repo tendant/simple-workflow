@@ -42,7 +42,7 @@ func (c *Client) Create(ctx context.Context, intent Intent) (string, error) {
 	}
 
 	query := `
-		INSERT INTO workflow.workflow_run (
+		INSERT INTO workflow_run (
 			id, type, payload, priority, run_at,
 			idempotency_key, max_attempts
 		) VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -74,7 +74,7 @@ func (c *Client) Create(ctx context.Context, intent Intent) (string, error) {
 // Cancel marks a workflow run as cancelled (cooperative cancellation)
 func (c *Client) Cancel(ctx context.Context, runID string) error {
 	query := `
-		UPDATE workflow.workflow_run
+		UPDATE workflow_run
 		SET status = 'cancelled', updated_at = NOW()
 		WHERE id = $1 AND status IN ('pending', 'leased')
 	`
@@ -111,7 +111,7 @@ func (c *Client) logEvent(ctx context.Context, workflowID, eventType string, dat
 	}
 
 	query := `
-		INSERT INTO workflow.workflow_event (workflow_id, event_type, data)
+		INSERT INTO workflow_event (workflow_id, event_type, data)
 		VALUES ($1, $2, $3)
 	`
 
