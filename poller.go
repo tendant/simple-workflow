@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -19,19 +21,94 @@ type PollerConfig struct {
 
 // Poller polls workflow_run table and executes workflows (Worker API)
 type Poller struct {
-	db            *sql.DB
-	typePrefixes  []string // e.g. ["billing.%", "media.%"]
-	executors     map[string]WorkflowExecutor
-	pollInterval  time.Duration
-	leaseDuration time.Duration
-	workerID      string
-	stopCh        chan struct{}
-	metrics       MetricsCollector // Optional: metrics collector for observability
-	startTime     time.Time        // Worker start time for uptime calculation
+	db               *sql.DB
+	typePrefixes     []string // e.g. ["billing.%", "media.%"]
+	executors        map[string]WorkflowExecutor
+	pollInterval     time.Duration
+	leaseDuration    time.Duration
+	workerID         string
+	stopCh           chan struct{}
+	metrics          MetricsCollector // Optional: metrics collector for observability
+	startTime        time.Time        // Worker start time for uptime calculation
+	ownsDB           bool             // true if Poller opened the DB connection
+	autoDetectPrefix bool             // true if type prefixes should be auto-detected from handlers
 }
 
-// NewPoller creates a new workflow run poller for workers
-func NewPoller(db *sql.DB, config PollerConfig) *Poller {
+// NewPoller creates a new workflow run poller from a PostgreSQL connection string.
+// Type prefixes are auto-detected from registered handlers.
+// Use fluent methods to configure: WithWorkerID(), WithLeaseDuration(), etc.
+//
+// Example:
+//   poller, err := NewPoller("postgres://user:pass@localhost/db?schema=workflow")
+//   poller.HandleFunc("billing.invoice.v1", handler)
+//   poller.Start(ctx)
+func NewPoller(connString string) (*Poller, error) {
+	// Parse connection string and inject search_path if needed
+	modifiedConn, _, err := ParseConnString(connString, DefaultSchema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse connection string: %w", err)
+	}
+
+	// Open database connection
+	db, err := sql.Open("postgres", modifiedConn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Generate default worker ID
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
+
+	return &Poller{
+		db:               db,
+		typePrefixes:     nil, // Will be auto-detected
+		executors:        make(map[string]WorkflowExecutor),
+		pollInterval:     2 * time.Second,  // default
+		leaseDuration:    30 * time.Second, // default
+		workerID:         workerID,
+		stopCh:           make(chan struct{}),
+		ownsDB:           true,
+		autoDetectPrefix: true,
+	}, nil
+}
+
+// NewPollerWithDB creates a new workflow run poller using an existing database connection.
+// Use this if you already have a connection pool or want to manage connections yourself.
+// The poller will NOT close the database connection.
+func NewPollerWithDB(db *sql.DB) *Poller {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
+
+	return &Poller{
+		db:               db,
+		typePrefixes:     nil, // Will be auto-detected
+		executors:        make(map[string]WorkflowExecutor),
+		pollInterval:     2 * time.Second,  // default
+		leaseDuration:    30 * time.Second, // default
+		workerID:         workerID,
+		stopCh:           make(chan struct{}),
+		ownsDB:           false,
+		autoDetectPrefix: true,
+	}
+}
+
+// NewPollerWithConfig creates a new workflow run poller with explicit configuration.
+// This is the old API kept for backward compatibility.
+//
+// Deprecated: Use NewPoller(connString) or NewPollerWithDB(db) with fluent configuration instead.
+func NewPollerWithConfig(db *sql.DB, config PollerConfig) *Poller {
 	// Set defaults
 	if config.LeaseDuration == 0 {
 		config.LeaseDuration = 30 * time.Second
@@ -40,23 +117,98 @@ func NewPoller(db *sql.DB, config PollerConfig) *Poller {
 		config.PollInterval = 2 * time.Second
 	}
 	if config.WorkerID == "" {
-		config.WorkerID = "go-worker"
+		hostname, _ := os.Hostname()
+		if hostname == "" {
+			hostname = "unknown"
+		}
+		config.WorkerID = fmt.Sprintf("%s-%d", hostname, os.Getpid())
 	}
 
 	return &Poller{
-		db:            db,
-		typePrefixes:  config.TypePrefixes,
-		executors:     make(map[string]WorkflowExecutor),
-		pollInterval:  config.PollInterval,
-		leaseDuration: config.LeaseDuration,
-		workerID:      config.WorkerID,
-		stopCh:        make(chan struct{}),
+		db:               db,
+		typePrefixes:     config.TypePrefixes,
+		executors:        make(map[string]WorkflowExecutor),
+		pollInterval:     config.PollInterval,
+		leaseDuration:    config.LeaseDuration,
+		workerID:         config.WorkerID,
+		stopCh:           make(chan struct{}),
+		ownsDB:           false,
+		autoDetectPrefix: len(config.TypePrefixes) == 0, // Auto-detect if not specified
 	}
 }
 
-// RegisterExecutor registers a workflow executor for a specific workflow type
+// WithWorkerID sets a custom worker ID.
+// Default: hostname-pid
+func (p *Poller) WithWorkerID(id string) *Poller {
+	p.workerID = id
+	return p
+}
+
+// WithLeaseDuration sets the lease duration for claimed workflow runs.
+// Default: 30 seconds
+func (p *Poller) WithLeaseDuration(d time.Duration) *Poller {
+	p.leaseDuration = d
+	return p
+}
+
+// WithPollInterval sets how often to poll for new workflow runs.
+// Default: 2 seconds
+func (p *Poller) WithPollInterval(d time.Duration) *Poller {
+	p.pollInterval = d
+	return p
+}
+
+// WithTypePrefixes explicitly sets type prefixes to watch.
+// This overrides auto-detection from registered handlers.
+// Example: WithTypePrefixes("billing.%", "notify.%")
+func (p *Poller) WithTypePrefixes(prefixes ...string) *Poller {
+	p.typePrefixes = prefixes
+	p.autoDetectPrefix = false
+	return p
+}
+
+// HandleFunc registers a function handler for a workflow type.
+// The function receives the WorkflowRun and returns a result or error.
+//
+// Example:
+//   poller.HandleFunc("billing.invoice.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) {
+//       // Process invoice
+//       return result, nil
+//   })
+func (p *Poller) HandleFunc(workflowType string, fn func(context.Context, *WorkflowRun) (interface{}, error)) *Poller {
+	p.executors[workflowType] = &funcExecutorAdapter{fn: fn}
+	return p
+}
+
+// Handle registers a WorkflowExecutor for a workflow type.
+// Use this for advanced cases where you need a stateful executor.
+func (p *Poller) Handle(workflowType string, executor WorkflowExecutor) *Poller {
+	p.executors[workflowType] = executor
+	return p
+}
+
+// RegisterExecutor registers a workflow executor for a specific workflow type.
+// Deprecated: Use Handle() or HandleFunc() instead.
 func (p *Poller) RegisterExecutor(workflowType string, executor WorkflowExecutor) {
 	p.executors[workflowType] = executor
+}
+
+// Close closes the database connection if it was opened by NewPoller.
+// If the poller was created with NewPollerWithDB, this is a no-op.
+func (p *Poller) Close() error {
+	if p.ownsDB && p.db != nil {
+		return p.db.Close()
+	}
+	return nil
+}
+
+// funcExecutorAdapter adapts a simple function to the WorkflowExecutor interface.
+type funcExecutorAdapter struct {
+	fn func(context.Context, *WorkflowRun) (interface{}, error)
+}
+
+func (a *funcExecutorAdapter) Execute(ctx context.Context, run *WorkflowRun) (interface{}, error) {
+	return a.fn(ctx, run)
 }
 
 // SetMetrics sets the metrics collector (optional, pass nil to disable metrics)
@@ -67,6 +219,16 @@ func (p *Poller) SetMetrics(m MetricsCollector) {
 
 // Start begins polling for workflow runs
 func (p *Poller) Start(ctx context.Context) {
+	// Auto-detect type prefixes from registered handlers if needed
+	if p.autoDetectPrefix && len(p.typePrefixes) == 0 {
+		p.typePrefixes = p.detectTypePrefixes()
+	}
+
+	// Validate that at least one handler is registered
+	if len(p.executors) == 0 {
+		log.Fatal("No workflow handlers registered. Use Handle() or HandleFunc() to register handlers.")
+	}
+
 	ticker := time.NewTicker(p.pollInterval)
 	defer ticker.Stop()
 
@@ -82,6 +244,39 @@ func (p *Poller) Start(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// detectTypePrefixes extracts type prefixes from registered handlers.
+// It auto-detects common prefixes to minimize polling overhead.
+func (p *Poller) detectTypePrefixes() []string {
+	prefixMap := make(map[string]bool)
+
+	for workflowType := range p.executors {
+		// Skip if it's already a prefix pattern
+		if strings.HasSuffix(workflowType, "%") {
+			prefixMap[workflowType] = true
+			continue
+		}
+
+		// Extract prefix (everything up to last dot + %)
+		parts := strings.Split(workflowType, ".")
+		if len(parts) > 1 {
+			// Use domain prefix (e.g., "billing.invoice.v1" -> "billing.%")
+			prefix := parts[0] + ".%"
+			prefixMap[prefix] = true
+		} else {
+			// No dots, use exact match
+			prefixMap[workflowType] = true
+		}
+	}
+
+	// Convert map to slice
+	prefixes := make([]string, 0, len(prefixMap))
+	for prefix := range prefixMap {
+		prefixes = append(prefixes, prefix)
+	}
+
+	return prefixes
 }
 
 // Stop stops the poller

@@ -12,12 +12,61 @@ import (
 
 // Client manages workflow runs in the database (Producer API)
 type Client struct {
-	db *sql.DB
+	db     *sql.DB
+	ownsDB bool // true if Client opened the DB connection
 }
 
-// NewClient creates a new client for managing workflow runs
-func NewClient(db *sql.DB) *Client {
-	return &Client{db: db}
+// NewClient creates a new client from a PostgreSQL connection string.
+// The connection string can include ?schema=name or ?search_path=name parameter.
+//
+// Examples:
+//   - NewClient("postgres://user:pass@localhost/db?schema=workflow")
+//   - NewClient("postgres://user:pass@localhost/db?search_path=workflow")
+//   - NewClient("postgres://user:pass@localhost/db") // uses default "workflow" schema
+//
+// The client will manage the database connection and Close() must be called.
+func NewClient(connString string) (*Client, error) {
+	// Parse connection string and inject search_path if needed
+	modifiedConn, _, err := ParseConnString(connString, DefaultSchema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse connection string: %w", err)
+	}
+
+	// Open database connection
+	db, err := sql.Open("postgres", modifiedConn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	return &Client{
+		db:     db,
+		ownsDB: true,
+	}, nil
+}
+
+// NewClientWithDB creates a new client using an existing database connection.
+// Use this if you already have a connection pool or want to manage connections yourself.
+// The client will NOT close the database connection.
+func NewClientWithDB(db *sql.DB) *Client {
+	return &Client{
+		db:     db,
+		ownsDB: false,
+	}
+}
+
+// Close closes the database connection if it was opened by NewClient.
+// If the client was created with NewClientWithDB, this is a no-op.
+func (c *Client) Close() error {
+	if c.ownsDB && c.db != nil {
+		return c.db.Close()
+	}
+	return nil
 }
 
 // Create inserts a new workflow run
@@ -120,4 +169,69 @@ func (c *Client) logEvent(ctx context.Context, workflowID, eventType string, dat
 	defer cancel()
 
 	_, _ = c.db.ExecContext(eventCtx, query, workflowID, eventType, dataJSON)
+}
+
+// Submit creates a new workflow run with fluent configuration.
+// Returns a SubmitBuilder for chaining configuration methods.
+//
+// Example:
+//   runID, err := client.Submit("billing.invoice.v1", payload).
+//       WithIdempotency("invoice:123").
+//       WithPriority(10).
+//       Execute(ctx)
+func (c *Client) Submit(workflowType string, payload interface{}) *SubmitBuilder {
+	return &SubmitBuilder{
+		client: c,
+		intent: Intent{
+			Type:        workflowType,
+			Payload:     payload,
+			Priority:    100, // default priority
+			MaxAttempts: 3,   // default max attempts
+		},
+	}
+}
+
+// SubmitBuilder provides a fluent API for configuring and submitting workflow runs.
+type SubmitBuilder struct {
+	client *Client
+	intent Intent
+}
+
+// WithIdempotency sets an idempotency key for deduplication.
+// If a workflow run with this key already exists, submission will be skipped.
+func (s *SubmitBuilder) WithIdempotency(key string) *SubmitBuilder {
+	s.intent.IdempotencyKey = key
+	return s
+}
+
+// WithPriority sets the priority (lower number = higher priority).
+// Default: 100
+func (s *SubmitBuilder) WithPriority(priority int) *SubmitBuilder {
+	s.intent.Priority = priority
+	return s
+}
+
+// WithMaxAttempts sets the maximum number of retry attempts.
+// Default: 3
+func (s *SubmitBuilder) WithMaxAttempts(attempts int) *SubmitBuilder {
+	s.intent.MaxAttempts = attempts
+	return s
+}
+
+// RunAfter schedules the workflow to run after a specific time.
+func (s *SubmitBuilder) RunAfter(t time.Time) *SubmitBuilder {
+	s.intent.RunAfter = t
+	return s
+}
+
+// RunIn schedules the workflow to run after a duration from now.
+func (s *SubmitBuilder) RunIn(d time.Duration) *SubmitBuilder {
+	s.intent.RunAfter = time.Now().Add(d)
+	return s
+}
+
+// Execute submits the workflow run and returns its ID.
+// Returns empty string if idempotency key conflict (run already exists).
+func (s *SubmitBuilder) Execute(ctx context.Context) (string, error) {
+	return s.client.Create(ctx, s.intent)
 }
