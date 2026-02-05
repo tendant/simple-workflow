@@ -1,12 +1,22 @@
 # simple-workflow
 
-A generic, durable workflow system for asynchronous work in Go and Python.
+A durable **system of record for intent** — not a workflow engine.
 
 ## Overview
 
-`simple-workflow` provides a **language-agnostic** way to declare work that should happen, with **durable persistence** using PostgreSQL and **loose coupling** between producers and workers.
+`simple-workflow` is **not** a workflow engine, orchestrator, or execution framework. It is a **system of record for intent**: a PostgreSQL-backed table that durably records *what should happen*, decoupled from *how or when it happens*.
 
-**Core Principle**: Creating a workflow means **recording intent**, not running code. If intent is stored successfully, the system guarantees eventual execution.
+Producers write intent. Workers poll for it. PostgreSQL is the only coordination point — there is no scheduler, no broker, no central executor. If intent is stored successfully, the system guarantees eventual execution.
+
+**What this is:**
+- A durable inbox for asynchronous work (PostgreSQL `workflow_run` table)
+- A contract between producers ("I need this done") and workers ("I can do this")
+- A system of record you can query, audit, and monitor with plain SQL
+
+**What this is not:**
+- Not a DAG engine (no step orchestration, no branching)
+- Not a task queue (no in-memory broker, no pub/sub)
+- Not an execution runtime (workers are your code, in any language)
 
 ## Features
 
@@ -220,26 +230,26 @@ See `python/README.md` for complete Python documentation.
 
 ```
 ┌─────────────┐
-│  Producer   │  Creates workflow runs
+│  Producer   │  Records pending intent
 │ (Your API)  │  - Never calls workers
 └──────┬──────┘  - Never depends on worker availability
        │
-       │ INSERT workflow run
+       │ INSERT intent (workflow_run)
        ↓
 ┌──────────────────────────┐
-│  workflow_run table      │  Durable inbox
+│  workflow_run table      │  System of record for intent
 │  (PostgreSQL)            │  - status: pending → leased → succeeded/failed/cancelled
 └──────┬───────────────────┘  - priority, run_at, idempotency_key
        │                      - type-prefix routing support
        │
-       │ claim + execute (with heartbeat)
+       │ claim + fulfill (with heartbeat)
        ↓
 ┌──────────────┐            ┌───────────────────────┐
 │   Worker     │            │  workflow_event table │  Audit trail
 │ (Go/Python)  │  ────────> │  (PostgreSQL)         │  - All lifecycle events
 └──────────────┘  log       └───────────────────────┘  - created, leased, succeeded, etc.
-  - Claims runs
-  - Reports results
+  - Claims pending intent
+  - Fulfills intent
   - Extends lease (heartbeat)
   - Checks cancellation
 ```
@@ -545,25 +555,25 @@ GROUP BY event_type;
 
 ## Design Principles
 
-### 1. Intent, not execution
+### 1. System of record for intent, not an execution engine
 
-Creating a workflow means **recording intent**, not running code. If intent is stored successfully, the system guarantees eventual execution.
+This library records **what should happen** — it does not orchestrate how it happens. There is no scheduler, no DAG planner, no central coordinator. PostgreSQL is the single source of truth. Workers are just processes that poll a table.
 
 ### 2. Producers never depend on workers
 
 **Producers**:
-- Insert intents
+- Insert intents (record what needs to happen)
 - Optionally query status
-- Never call workers
+- Never call workers, never know which language runs the work
 
 **Workers**:
-- Pull work
+- Poll for pending intent
 - Execute logic
-- Report results
+- Report results back to the same table
 
 ### 3. Execution runtime is an implementation detail
 
-The same workflow may be implemented in Go today, Python tomorrow. Producers never care.
+The same intent may be fulfilled by Go today, Python tomorrow. Producers never care. The `workflow_run` table is the contract — everything else is pluggable.
 
 ## Makefile Commands
 
