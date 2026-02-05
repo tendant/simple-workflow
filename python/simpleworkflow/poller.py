@@ -341,46 +341,49 @@ class IntentPoller:
             )
 
     def claim_run(self) -> Optional[WorkflowRun]:
-        """Claim a pending workflow run using SELECT FOR UPDATE SKIP LOCKED"""
+        """Claim a pending workflow run using atomic UPDATE...RETURNING with SKIP LOCKED"""
         conn = None
         try:
             conn = self._connect()
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Build WHERE clause for type-prefix matching
-                where_clauses = " AND (" + " OR ".join(
-                    f"type LIKE '{prefix}'" for prefix in self.type_prefixes
-                ) + ")" if self.type_prefixes else ""
+                # Build parameterized type-prefix LIKE conditions
+                params = [
+                    self.worker_id,
+                    str(self.lease_duration) + " seconds",
+                ]
 
-                # Claim workflow run
+                type_condition = ""
+                if self.type_prefixes:
+                    likes = []
+                    for prefix in self.type_prefixes:
+                        likes.append("type LIKE %s")
+                        params.append(prefix)
+                    type_condition = " AND (" + " OR ".join(likes) + ")"
+
+                # Atomic claim: UPDATE...RETURNING with SKIP LOCKED subquery
                 query = f"""
-                    SELECT id, type, payload, attempt, max_attempts
-                    FROM workflow_run
-                    WHERE status = 'pending'
-                      AND run_at <= NOW()
-                      AND deleted_at IS NULL
-                      {where_clauses}
-                    ORDER BY priority ASC, created_at ASC
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT 1
+                    UPDATE workflow_run
+                    SET status = 'leased',
+                        leased_by = %s,
+                        lease_until = NOW() + (%s)::interval,
+                        updated_at = NOW()
+                    WHERE id = (
+                        SELECT id FROM workflow_run
+                        WHERE status = 'pending'
+                          AND run_at <= NOW()
+                          AND deleted_at IS NULL
+                          {type_condition}
+                        ORDER BY priority ASC, created_at ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    RETURNING id, type, payload, attempt, max_attempts
                 """
-                cur.execute(query)
+                cur.execute(query, tuple(params))
 
                 row = cur.fetchone()
                 if row is None:
                     return None
-
-                # Mark as leased
-                cur.execute(
-                    """
-                    UPDATE workflow_run
-                    SET status = 'leased',
-                        leased_by = %s,
-                        lease_until = NOW() + INTERVAL '%s seconds',
-                        updated_at = NOW()
-                    WHERE id = %s
-                """,
-                    (self.worker_id, self.lease_duration, row["id"]),
-                )
 
                 conn.commit()
 
@@ -589,7 +592,7 @@ class IntentPoller:
                 cur.execute(
                     """
                     UPDATE workflow_run
-                    SET lease_until = NOW() + INTERVAL '%s seconds',
+                    SET lease_until = NOW() + (%s || ' seconds')::interval,
                         updated_at = NOW()
                     WHERE id = %s AND status = 'leased'
                 """,

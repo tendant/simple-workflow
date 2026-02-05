@@ -256,41 +256,46 @@ func (p *Poller) pollAndExecute(ctx context.Context) {
 }
 
 func (p *Poller) claimRun(ctx context.Context) (*WorkflowRun, error) {
-	tx, err := p.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
+	// Build parameterized type-prefix LIKE conditions
+	// Parameters: $1 = workerID, $2 = leaseDuration, $3.. = type prefixes
+	args := []interface{}{
+		p.workerID,
+		fmt.Sprintf("%d seconds", int(p.leaseDuration.Seconds())),
 	}
-	defer tx.Rollback()
 
-	// Build WHERE clause for type-prefix matching
-	// Example: (type LIKE 'billing.%' OR type LIKE 'payment.%')
-	whereClauses := ""
+	typeCondition := ""
 	if len(p.typePrefixes) > 0 {
-		whereClauses = " AND ("
+		likes := make([]string, len(p.typePrefixes))
 		for i, prefix := range p.typePrefixes {
-			if i > 0 {
-				whereClauses += " OR "
-			}
-			whereClauses += fmt.Sprintf("type LIKE '%s'", prefix)
+			paramIdx := i + 3 // $3, $4, ...
+			likes[i] = fmt.Sprintf("type LIKE $%d", paramIdx)
+			args = append(args, prefix)
 		}
-		whereClauses += ")"
+		typeCondition = " AND (" + strings.Join(likes, " OR ") + ")"
 	}
 
-	// Claim using SELECT FOR UPDATE SKIP LOCKED
+	// Atomic claim: UPDATE...RETURNING with SKIP LOCKED subquery
 	query := fmt.Sprintf(`
-		SELECT id, type, payload, attempt, max_attempts
-		FROM workflow_run
-		WHERE status = 'pending'
-		  AND run_at <= NOW()
-		  AND deleted_at IS NULL
-		  %s
-		ORDER BY priority ASC, created_at ASC
-		FOR UPDATE SKIP LOCKED
-		LIMIT 1
-	`, whereClauses)
+		UPDATE workflow_run
+		SET status = 'leased',
+			leased_by = $1,
+			lease_until = NOW() + $2::interval,
+			updated_at = NOW()
+		WHERE id = (
+			SELECT id FROM workflow_run
+			WHERE status = 'pending'
+			  AND run_at <= NOW()
+			  AND deleted_at IS NULL
+			  %s
+			ORDER BY priority ASC, created_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING id, type, payload, attempt, max_attempts
+	`, typeCondition)
 
 	var run WorkflowRun
-	err = tx.QueryRowContext(ctx, query).Scan(
+	err := p.db.QueryRowContext(ctx, query, args...).Scan(
 		&run.ID, &run.Type, &run.Payload,
 		&run.Attempt, &run.MaxAttempts,
 	)
@@ -298,25 +303,6 @@ func (p *Poller) claimRun(ctx context.Context) (*WorkflowRun, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
-	}
-
-	// Mark as leased
-	updateQuery := `
-		UPDATE workflow_run
-		SET status = 'leased',
-			leased_by = $1,
-			lease_until = NOW() + $2::interval,
-			updated_at = NOW()
-		WHERE id = $3
-	`
-	leaseDuration := fmt.Sprintf("%d seconds", int(p.leaseDuration.Seconds()))
-	_, err = tx.ExecContext(ctx, updateQuery, p.workerID, leaseDuration, run.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
