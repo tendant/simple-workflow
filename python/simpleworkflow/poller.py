@@ -9,6 +9,7 @@ import os
 import random
 import socket
 import time
+import threading
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Callable, List
@@ -262,6 +263,10 @@ class IntentPoller:
             raise ValueError("No workflow handlers registered. Use handle_func() or register_executor() to register handlers.")
 
         self.running = True
+
+        # Start schedule ticker if enabled
+        self._start_schedule_ticker()
+
         logger.info(
             f"Workflow poller started, watching type prefixes: {self.type_prefixes}"
         )
@@ -278,6 +283,7 @@ class IntentPoller:
     def stop(self):
         """Stop polling"""
         self.running = False
+        self._stop_schedule_ticker()
         logger.info("Workflow poller stopped")
 
     def poll_and_execute(self):
@@ -632,6 +638,37 @@ class IntentPoller:
         finally:
             if conn:
                 conn.close()
+
+    def enable_schedule_ticker(self, tick_interval: int = 15):
+        """
+        Enable the embedded schedule ticker.
+        The ticker converts due workflow_schedule rows into workflow_run rows.
+
+        Args:
+            tick_interval: How often to check for due schedules, in seconds (default: 15)
+        """
+        from .schedule_ticker import ScheduleTicker
+        self._schedule_ticker = ScheduleTicker(self.db_url, tick_interval)
+        if self.search_path != 'workflow':
+            # Reconstruct URL with schema for the ticker
+            self._schedule_ticker.search_path = self.search_path
+        self._schedule_ticker_enabled = True
+
+    def _start_schedule_ticker(self):
+        """Start the schedule ticker in a background thread"""
+        if getattr(self, '_schedule_ticker_enabled', False):
+            self._schedule_ticker_thread = threading.Thread(
+                target=self._schedule_ticker.start,
+                daemon=True,
+                name="schedule-ticker",
+            )
+            self._schedule_ticker_thread.start()
+            logger.info(f"Embedded schedule ticker started (interval: {self._schedule_ticker.tick_interval}s)")
+
+    def _stop_schedule_ticker(self):
+        """Stop the embedded schedule ticker"""
+        if getattr(self, '_schedule_ticker_enabled', False):
+            self._schedule_ticker.stop()
 
     def _log_event(self, workflow_id: str, event_type: str, data: Optional[Dict[str, Any]]):
         """Log an audit event (best-effort, errors are ignored)"""

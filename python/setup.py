@@ -30,5 +30,6 @@ setup(
     python_requires=">=3.9",
     install_requires=[
         "psycopg2-binary>=2.9.0",
+        "croniter>=1.3.0",
     ],
 )

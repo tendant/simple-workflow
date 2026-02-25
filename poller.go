@@ -31,6 +31,10 @@ type Poller struct {
 	metrics          MetricsCollector // Optional: metrics collector for observability
 	startTime        time.Time        // Worker start time for uptime calculation
 	autoDetectPrefix bool             // true if type prefixes should be auto-detected from handlers
+
+	// Schedule ticker (optional, enabled via WithScheduleTicker)
+	scheduleTicker         *ScheduleTicker
+	scheduleTickerEnabled  bool
 }
 
 // NewPoller creates a new workflow run poller from a PostgreSQL connection string.
@@ -100,6 +104,24 @@ func (p *Poller) WithPollInterval(d time.Duration) *Poller {
 	return p
 }
 
+// WithScheduleTicker enables the schedule ticker inside the poller.
+// The ticker converts due workflow_schedule rows into workflow_run rows.
+func (p *Poller) WithScheduleTicker() *Poller {
+	p.scheduleTickerEnabled = true
+	return p
+}
+
+// WithScheduleTickInterval sets the tick interval for the embedded schedule ticker.
+// Default: 15 seconds. Only effective if WithScheduleTicker() is also called.
+func (p *Poller) WithScheduleTickInterval(d time.Duration) *Poller {
+	p.scheduleTickerEnabled = true
+	if p.scheduleTicker == nil {
+		p.scheduleTicker = newScheduleTickerFromDB(p.db)
+	}
+	p.scheduleTicker.tickInterval = d
+	return p
+}
+
 // WithTypePrefixes explicitly sets type prefixes to watch.
 // This overrides auto-detection from registered handlers.
 // Example: WithTypePrefixes("billing.%", "notify.%")
@@ -164,6 +186,15 @@ func (p *Poller) Start(ctx context.Context) {
 		log.Fatal("No workflow handlers registered. Use Handle() or HandleFunc() to register handlers.")
 	}
 
+	// Start schedule ticker goroutine if enabled
+	if p.scheduleTickerEnabled {
+		if p.scheduleTicker == nil {
+			p.scheduleTicker = newScheduleTickerFromDB(p.db)
+		}
+		go p.scheduleTicker.Start(ctx)
+		log.Printf("Embedded schedule ticker started (interval: %s)", p.scheduleTicker.tickInterval)
+	}
+
 	ticker := time.NewTicker(p.pollInterval)
 	defer ticker.Stop()
 
@@ -174,8 +205,14 @@ func (p *Poller) Start(ctx context.Context) {
 		case <-ticker.C:
 			p.pollAndExecute(ctx)
 		case <-p.stopCh:
+			if p.scheduleTicker != nil {
+				p.scheduleTicker.Stop()
+			}
 			return
 		case <-ctx.Done():
+			if p.scheduleTicker != nil {
+				p.scheduleTicker.Stop()
+			}
 			return
 		}
 	}

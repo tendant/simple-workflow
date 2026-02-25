@@ -42,3 +42,17 @@ type WorkflowExecutor interface {
 	// Execute runs the workflow and returns the result or error
 	Execute(ctx context.Context, run *WorkflowRun) (interface{}, error)
 }
+
+// Schedule represents a recurring workflow schedule.
+type Schedule struct {
+	ID          string
+	Type        string
+	Payload     interface{}
+	CronExpr    string
+	Timezone    string
+	NextRunAt   time.Time
+	LastRunAt   *time.Time
+	Enabled     bool
+	Priority    int
+	MaxAttempts int
+}

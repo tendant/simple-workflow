@@ -6,11 +6,14 @@ Creates and manages workflow runs
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse, parse_qs, urlunparse
 import psycopg2
 from psycopg2 import sql
+from psycopg2.extras import RealDictCursor
 import uuid
+
+from croniter import croniter
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +226,98 @@ class Client:
         finally:
             conn.close()
 
+    def schedule(self, workflow_type: str, payload: Dict[str, Any]) -> 'ScheduleBuilder':
+        """
+        Create a recurring workflow schedule with fluent configuration.
+
+        Args:
+            workflow_type: Workflow type (e.g., "report.daily.v1")
+            payload: Static JSON-serializable payload for each firing
+
+        Returns:
+            ScheduleBuilder for method chaining
+
+        Example:
+            schedule_id = client.schedule("report.daily.v1", {...}).
+                cron("0 9 * * 1").
+                in_timezone("America/New_York").
+                create()
+        """
+        return ScheduleBuilder(self, workflow_type, payload)
+
+    def pause_schedule(self, schedule_id: str) -> None:
+        """Pause a schedule so it won't fire."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE workflow_schedule
+                    SET enabled = false, updated_at = NOW()
+                    WHERE id = %s AND deleted_at IS NULL
+                """, (schedule_id,))
+                if cur.rowcount == 0:
+                    raise ValueError(f"Schedule {schedule_id} not found")
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def resume_schedule(self, schedule_id: str) -> None:
+        """Resume a paused schedule."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE workflow_schedule
+                    SET enabled = true, updated_at = NOW()
+                    WHERE id = %s AND deleted_at IS NULL
+                """, (schedule_id,))
+                if cur.rowcount == 0:
+                    raise ValueError(f"Schedule {schedule_id} not found")
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def delete_schedule(self, schedule_id: str) -> None:
+        """Soft-delete a schedule."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE workflow_schedule
+                    SET deleted_at = NOW(), enabled = false, updated_at = NOW()
+                    WHERE id = %s AND deleted_at IS NULL
+                """, (schedule_id,))
+                if cur.rowcount == 0:
+                    raise ValueError(f"Schedule {schedule_id} not found")
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_schedules(self) -> list:
+        """Return all active (non-deleted) schedules."""
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, type, payload, schedule, timezone,
+                           next_run_at, last_run_at, enabled, priority, max_attempts
+                    FROM workflow_schedule
+                    WHERE deleted_at IS NULL
+                    ORDER BY created_at ASC
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
+
     def _log_event(self, conn, workflow_id: str, event_type: str, data: Optional[Dict[str, Any]]):
         """Log an audit event (best-effort, errors are ignored)"""
         try:
@@ -238,3 +333,81 @@ class Client:
             logger.debug(f"Failed to log event: {e}")
             # Ignore errors - event logging is best-effort
             pass
+
+
+class ScheduleBuilder:
+    """Fluent API for creating workflow schedules"""
+
+    def __init__(self, client: Client, workflow_type: str, payload: Any):
+        self.client = client
+        self.workflow_type = workflow_type
+        self.payload = payload
+        self.cron_expr: Optional[str] = None
+        self.tz: str = "UTC"
+        self.priority_val: int = 100
+        self.max_attempts_val: int = 3
+
+    def cron(self, expr: str) -> 'ScheduleBuilder':
+        """Set the cron expression (5-field standard format)."""
+        self.cron_expr = expr
+        return self
+
+    def in_timezone(self, tz: str) -> 'ScheduleBuilder':
+        """Set the IANA timezone. Default: 'UTC'"""
+        self.tz = tz
+        return self
+
+    def with_priority(self, p: int) -> 'ScheduleBuilder':
+        """Set priority inherited by created runs. Default: 100"""
+        self.priority_val = p
+        return self
+
+    def with_max_attempts(self, n: int) -> 'ScheduleBuilder':
+        """Set max attempts inherited by created runs. Default: 3"""
+        self.max_attempts_val = n
+        return self
+
+    def create(self) -> str:
+        """
+        Validate the cron expression, compute next run time, and insert the schedule.
+        Returns the schedule ID.
+        """
+        if not self.cron_expr:
+            raise ValueError("Cron expression is required")
+
+        # Validate cron expression
+        if not croniter.is_valid(self.cron_expr):
+            raise ValueError(f"Invalid cron expression: {self.cron_expr!r}")
+
+        # Compute next run time
+        cron = croniter(self.cron_expr, datetime.now())
+        next_run = cron.get_next(datetime)
+
+        payload_json = json.dumps(self.payload)
+
+        conn = self.client._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO workflow_schedule (
+                        type, payload, schedule, timezone, next_run_at,
+                        priority, max_attempts
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    self.workflow_type,
+                    payload_json,
+                    self.cron_expr,
+                    self.tz,
+                    next_run,
+                    self.priority_val,
+                    self.max_attempts_val,
+                ))
+                result = cur.fetchone()
+                conn.commit()
+                return str(result[0])
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
