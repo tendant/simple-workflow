@@ -10,7 +10,7 @@ Start the server if not running:
 
 ```bash
 cd /Users/lei/workspace/workflow/simple-workflow
-go run ./cmd/server --db "host=localhost port=5432 user=postgres password=postgres dbname=workflow sslmode=disable search_path=workflow"
+go run ./cmd/server --db "sqlite://workflow.db" --migrate
 ```
 
 Check health: `curl -s http://localhost:8080/api/v1/health`
