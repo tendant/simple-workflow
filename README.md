@@ -4,421 +4,101 @@ A durable **system of record for intent** — not a workflow engine.
 
 ## Overview
 
-`simple-workflow` is **not** a workflow engine, orchestrator, or execution framework. It is a **system of record for intent**: a PostgreSQL-backed table that durably records *what should happen*, decoupled from *how or when it happens*.
+`simple-workflow` records *what should happen*, decoupled from *how or when it happens*. Producers write intent to a `workflow_run` table. Workers poll for it. PostgreSQL (or SQLite) is the only coordination point — no scheduler, no broker, no central executor.
 
-Producers write intent. Workers poll for it. PostgreSQL is the only coordination point — there is no scheduler, no broker, no central executor. If intent is stored successfully, the system guarantees eventual execution.
-
-**What this is:**
-- A durable inbox for asynchronous work (PostgreSQL `workflow_run` table)
+- A durable inbox for asynchronous work
 - A contract between producers ("I need this done") and workers ("I can do this")
 - A system of record you can query, audit, and monitor with plain SQL
 
-**What this is not:**
-- Not a DAG engine (no step orchestration, no branching)
-- Not a task queue (no in-memory broker, no pub/sub)
-- Not an execution runtime (workers are your code, in any language)
-
 ## Features
 
-- 🔒 **Durable persistence** - Workflow runs survive crashes and restarts
-- 🔄 **Automatic retries** - Failed runs retry with exponential backoff and jitter
-- 🎯 **Idempotency** - Duplicate requests don't create duplicate work
-- 📊 **Observable** - Track workflow status and audit trail in PostgreSQL
-- 🚀 **Language-agnostic** - Producers don't know execution runtime
-- ⚖️ **Priority & scheduling** - Control execution order and timing
-- 🎯 **Type-prefix routing** - Route workflows by type pattern (e.g., `billing.%`)
-- 💓 **Heartbeat support** - Long-running jobs can extend their lease
-- 🚫 **Cooperative cancellation** - Cancel workflows gracefully
-- 📝 **Audit trail** - All lifecycle events logged to `workflow_event` table
+- **Durable persistence** — workflow runs survive crashes and restarts
+- **Automatic retries** — exponential backoff with jitter
+- **Idempotency** — duplicate requests don't create duplicate work
+- **Observable** — audit trail in PostgreSQL via `workflow_event` table
+- **Type-prefix routing** — route workflows by pattern (e.g., `billing.%`)
+- **Heartbeat & cancellation** — long-running jobs extend leases; cancel gracefully
+- **Priority & scheduling** — control execution order and timing
 
 ## Installation
-
-### Go
 
 ```bash
 go get github.com/tendant/simple-workflow
 ```
 
-### Python
-
-```bash
-cd python
-pip install -r requirements.txt
-# Or install as package
-pip install -e .
-```
+Python: see [`python/README.md`](python/README.md).
 
 ## Quick Start
 
-### Simplest: All-in-One with `Workflow`
-
-The `Workflow` type combines producer and worker into a single entry point — perfect for getting started:
-
 ```go
-package main
+wf, err := simpleworkflow.New("sqlite:///tmp/workflow.db")
+if err != nil { log.Fatal(err) }
+defer wf.Close()
 
-import (
-    "context"
-    "log"
+wf.HandleFunc("demo.hello.v1", func(ctx context.Context, run *simpleworkflow.WorkflowRun) (any, error) {
+    log.Printf("Hello! payload=%s", run.Payload)
+    return map[string]string{"status": "done"}, nil
+})
 
-    simpleworkflow "github.com/tendant/simple-workflow"
-)
+runID, _ := wf.Submit("demo.hello.v1", map[string]string{"msg": "hi"}).Execute(ctx)
 
-func main() {
-    wf, err := simpleworkflow.New("sqlite:///tmp/workflow.db")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer wf.Close()
-
-    // Register a handler
-    wf.HandleFunc("demo.hello.v1", func(ctx context.Context, run *simpleworkflow.WorkflowRun) (any, error) {
-        log.Printf("Hello! payload=%s", run.Payload)
-        return map[string]string{"status": "done"}, nil
-    })
-
-    ctx := context.Background()
-
-    // Submit a workflow run
-    runID, _ := wf.Submit("demo.hello.v1", map[string]string{"msg": "hi"}).Execute(ctx)
-    log.Printf("Submitted: %s", runID)
-
-    // WithAutoMigrate() creates tables on first Start() — no external migration tool needed
-    wf.WithAutoMigrate().Start(ctx)
-}
+wf.WithAutoMigrate().Start(ctx) // creates tables automatically
 ```
-
-`WithAutoMigrate()` runs embedded DDL on `Start()`, so there's no need for `goose` or `make migrate-up` when getting started. Works for both SQLite and PostgreSQL.
 
 ### Migrations
 
-There are two paths for schema management:
-
 **Embedded DDL (recommended for getting started):**
 ```go
-// Option A: auto-migrate on Start()
-wf.WithAutoMigrate().Start(ctx)
-
-// Option B: migrate explicitly
-wf.AutoMigrate(ctx)
-
-// Also works on Client and Poller individually
-client.AutoMigrate(ctx)
-poller.AutoMigrate(ctx)
+wf.WithAutoMigrate().Start(ctx)   // auto-migrate on Start()
+wf.AutoMigrate(ctx)               // or migrate explicitly
+client.AutoMigrate(ctx)           // also works on Client and Poller
 ```
 
-This works for both SQLite and PostgreSQL — no external tools needed.
+Works for both SQLite and PostgreSQL — no external tools needed.
 
-**Version-controlled migrations (recommended for production PostgreSQL):**
+**Version-controlled migrations (recommended for production):**
 ```bash
-# Using goose via Makefile
-make migrate-up
-
-# Or directly
-goose -dir migrations postgres "host=localhost user=postgres dbname=workflow password=postgres sslmode=disable search_path=workflow" up
-
-# Check status / rollback
-make migrate-status
-make migrate-down
+make migrate-up       # apply all pending migrations
+make migrate-status   # check status
+make migrate-down     # rollback last migration
 ```
 
-### 1. Producer: Create Workflow Runs (Go)
-
-The simplified API uses connection strings and fluent builders:
+### Producer
 
 ```go
-package main
+client, _ := simpleworkflow.NewClient("postgres://user:pass@localhost/db?schema=workflow")
+defer client.Close()
 
-import (
-    "context"
-    simpleworkflow "github.com/tendant/simple-workflow"
-    _ "github.com/lib/pq"
-)
-
-func main() {
-    // Create client from connection string
-    client, _ := simpleworkflow.NewClient("postgres://user:pass@localhost/db?schema=workflow")
-    defer client.Close()
-
-    // Submit workflow with fluent API
-    runID, err := client.Submit("content.thumbnail.v1", map[string]interface{}{
-        "content_id": "c_123",
-        "width":      300,
-        "height":     300,
-    }).
+runID, err := client.Submit("content.thumbnail.v1", payload).
     WithIdempotency("thumbnail:c_123:300x300").
     WithPriority(10).
-    Execute(context.Background())
+    Execute(ctx)
 
-    if err != nil {
-        panic(err)
-    }
-
-    println("Created workflow run:", runID)
-
-    // Optional: Cancel a workflow run
-    // err = client.Cancel(context.Background(), runID)
-}
+err = client.Cancel(ctx, runID)
 ```
 
-### 2. Worker: Execute Workflow Runs (Go)
-
-The simplified API uses function handlers instead of executor structs:
+### Worker
 
 ```go
-package main
+poller, _ := simpleworkflow.NewPoller("postgres://user:pass@localhost/db?schema=workflow")
+defer poller.Close()
 
-import (
-    "context"
-    "encoding/json"
-    "fmt"
-    simpleworkflow "github.com/tendant/simple-workflow"
-    _ "github.com/lib/pq"
-)
+poller.HandleFunc("content.thumbnail.v1", func(ctx context.Context, run *simpleworkflow.WorkflowRun) (any, error) {
+    var params struct {
+        ContentID string `json:"content_id"`
+        Width     int    `json:"width"`
+    }
+    json.Unmarshal(run.Payload, &params)
+    fmt.Printf("Generating thumbnail for %s\n", params.ContentID)
+    return map[string]string{"status": "completed"}, nil
+})
 
-func main() {
-    // Create poller from connection string (auto-detects type prefix!)
-    poller, _ := simpleworkflow.NewPoller("postgres://user:pass@localhost/db?schema=workflow")
-    defer poller.Close()
-
-    // Register handler using inline function (no executor struct needed)
-    poller.HandleFunc("content.thumbnail.v1", func(ctx context.Context, run *simpleworkflow.WorkflowRun) (interface{}, error) {
-        var params struct {
-            ContentID string `json:"content_id"`
-            Width     int    `json:"width"`
-            Height    int    `json:"height"`
-        }
-        if err := json.Unmarshal(run.Payload, &params); err != nil {
-            return nil, err
-        }
-
-        fmt.Printf("Generating thumbnail for %s (%dx%d)\n", params.ContentID, params.Width, params.Height)
-
-        // For long-running jobs, extend the lease
-        // run.Heartbeat(ctx, 30*time.Second)
-
-        // Check for cancellation
-        // if cancelled, _ := run.IsCancelled(ctx); cancelled {
-        //     return nil, fmt.Errorf("workflow cancelled")
-        // }
-
-        return map[string]string{"status": "completed"}, nil
-    })
-
-    // Start polling (blocks until interrupted)
-    // Type prefix "content.%" is auto-detected from registered handlers!
-    poller.Start(context.Background())
-}
-```
-
-**What's simplified:**
-- ✅ No manual `sql.Open()` - connection string does it all
-- ✅ No executor structs - use inline functions
-- ✅ No manual configuration - smart defaults (hostname-pid, 30s lease, 2s poll)
-- ✅ Type prefix auto-detected from handlers
-- ✅ Connection management automatic with `Close()`
-- ✅ Worker ID auto-generated: `hostname-pid`
-
-### 3. Worker: Execute Workflow Runs (Python)
-
-Python workers use the same `workflow_run` table and have similar simplified API:
-
-```python
-#!/usr/bin/env python3
-from simpleworkflow import IntentPoller, WorkflowExecutor, WorkflowRun
-
-class ThumbnailExecutor(WorkflowExecutor):
-    def execute(self, run: WorkflowRun):
-        payload = run.payload
-        content_id = payload['content_id']
-        width = payload['width']
-        height = payload['height']
-
-        # Execute workflow logic
-        print(f"Generating thumbnail for {content_id} ({width}x{height})")
-
-        # For long-running jobs, extend the lease
-        # run.heartbeat(30)  # Extend by 30 seconds
-
-        # Check for cancellation
-        # if run.is_cancelled():
-        #     raise Exception("Workflow cancelled")
-
-        return {"status": "completed"}
-
-# Database URL (must include search_path=workflow)
-db_url = "postgres://user:pass@localhost/db?search_path=workflow"
-
-# Create and configure poller
-poller = IntentPoller(
-    db_url=db_url,
-    type_prefixes=["content.%"],  # Type-prefix routing
-    worker_id="thumbnail-worker-python",
-    lease_duration=30,  # Lease duration in seconds
-    poll_interval=2     # Poll interval in seconds
-)
-
-# Register executor
-poller.register_executor("content.thumbnail.v1", ThumbnailExecutor())
-
-# Start polling
-poller.start()
-```
-
-See `python/README.md` for complete Python documentation.
-
-## Architecture
-
-```
-┌─────────────┐
-│  Producer   │  Records pending intent
-│ (Your API)  │  - Never calls workers
-└──────┬──────┘  - Never depends on worker availability
-       │
-       │ INSERT intent (workflow_run)
-       ↓
-┌──────────────────────────┐
-│  workflow_run table      │  System of record for intent
-│  (PostgreSQL)            │  - status: pending → leased → succeeded/failed/cancelled
-└──────┬───────────────────┘  - priority, run_at, idempotency_key
-       │                      - type-prefix routing support
-       │
-       │ claim + fulfill (with heartbeat)
-       ↓
-┌──────────────┐            ┌───────────────────────┐
-│   Worker     │            │  workflow_event table │  Audit trail
-│ (Go/Python)  │  ────────> │  (PostgreSQL)         │  - All lifecycle events
-└──────────────┘  log       └───────────────────────┘  - created, leased, succeeded, etc.
-  - Claims pending intent
-  - Fulfills intent
-  - Extends lease (heartbeat)
-  - Checks cancellation
+poller.Start(ctx) // type prefix "content.%" auto-detected from handlers
 ```
 
 ## API Reference
 
-### Simplified API (Recommended)
-
-#### Producer API
-
-**Create Client:**
-```go
-// From connection string (manages connection automatically)
-client, err := simpleworkflow.NewClient("postgres://user:pass@host/db?schema=workflow")
-defer client.Close()
-
-// Or use existing DB connection
-client := simpleworkflow.NewClientWithDB(db)
-```
-
-**Submit Workflows:**
-```go
-// Fluent API with method chaining
-runID, err := client.Submit("workflow.type.v1", payload).
-    WithIdempotency("unique-key").
-    WithPriority(10).
-    WithMaxAttempts(5).
-    RunIn(5 * time.Minute).  // or RunAfter(time.Time)
-    Execute(ctx)
-
-// Cancel workflow
-err := client.Cancel(ctx, runID)
-```
-
-#### Worker API
-
-**Create Poller:**
-```go
-// From connection string (auto-detects type prefix from handlers!)
-poller, err := simpleworkflow.NewPoller("postgres://user:pass@host/db?schema=workflow")
-defer poller.Close()
-
-// Or use existing DB connection
-poller := simpleworkflow.NewPollerWithDB(db)
-
-// Optional: Configure with fluent API
-poller.WithWorkerID("custom-worker").
-    WithLeaseDuration(60 * time.Second).
-    WithPollInterval(5 * time.Second).
-    WithTypePrefixes("billing.%", "media.%")  // Override auto-detection
-```
-
-**Register Handlers:**
-```go
-// Function handler (no executor struct needed!)
-poller.HandleFunc("billing.invoice.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) {
-    // Process workflow
-    return result, nil
-})
-
-// Or use executor struct for stateful handlers
-poller.Handle("billing.payment.v1", &PaymentExecutor{})
-
-// Start polling (blocks until context cancelled)
-poller.Start(ctx)
-```
-
-**Smart Defaults:**
-- Worker ID: `hostname-pid` (e.g., `my-server-12345`)
-- Lease duration: `30 seconds`
-- Poll interval: `2 seconds`
-- Type prefixes: Auto-detected from registered handlers
-- Schema: `workflow` (or from `?schema=` parameter)
-
-#### All-in-One `Workflow` API
-
-Combines producer and worker in a single object — ideal for small services or getting started.
-
-**Create Workflow:**
-```go
-// From connection string (SQLite or PostgreSQL)
-wf, err := simpleworkflow.New("sqlite:///tmp/workflow.db")
-wf, err := simpleworkflow.New("postgres://user:pass@host/db?schema=workflow")
-defer wf.Close()
-
-// Or from existing DB connection
-wf := simpleworkflow.NewWithDB(db, dialect)
-```
-
-**Use it:**
-```go
-// Register handlers (same API as Poller)
-wf.HandleFunc("demo.hello.v1", handler)
-wf.Handle("demo.hello.v1", &MyExecutor{})
-
-// Submit workflows (same API as Client)
-runID, err := wf.Submit("demo.hello.v1", payload).Execute(ctx)
-err := wf.Cancel(ctx, runID)
-
-// Configure (fluent, same options as Poller)
-wf.WithWorkerID("my-worker").WithPollInterval(5 * time.Second)
-
-// Start polling
-wf.WithAutoMigrate().Start(ctx)
-```
-
-#### `WithAutoMigrate()`
-
-Available on both `Poller` and `Workflow`. When enabled, `Start()` automatically runs the embedded DDL before polling begins.
-
-```go
-// On Workflow
-wf.WithAutoMigrate().Start(ctx)
-
-// On Poller
-poller.WithAutoMigrate().Start(ctx)
-```
-
-You can also call `AutoMigrate(ctx)` explicitly on `Client`, `Poller`, or `Workflow`:
-```go
-client.AutoMigrate(ctx)
-poller.AutoMigrate(ctx)
-wf.AutoMigrate(ctx)
-```
-
-Works for both SQLite and PostgreSQL — runs idempotent `CREATE TABLE IF NOT EXISTS` statements.
-
-#### Connection Strings
+### Connection Strings
 
 | Database   | Format | Example |
 |------------|--------|---------|
@@ -427,13 +107,75 @@ Works for both SQLite and PostgreSQL — runs idempotent `CREATE TABLE IF NOT EX
 
 The `?schema=` parameter sets the PostgreSQL `search_path` (defaults to `workflow`).
 
----
+### Client (Producer)
+
+```go
+client, err := simpleworkflow.NewClient("postgres://...")   // from connection string
+client := simpleworkflow.NewClientWithDB(db)                // from existing *sql.DB
+defer client.Close()
+
+runID, err := client.Submit("workflow.type.v1", payload).
+    WithIdempotency("unique-key").
+    WithPriority(10).
+    WithMaxAttempts(5).
+    RunIn(5 * time.Minute).
+    Execute(ctx)
+
+err = client.Cancel(ctx, runID)
+```
+
+### Poller (Worker)
+
+```go
+poller, err := simpleworkflow.NewPoller("postgres://...")    // from connection string
+poller := simpleworkflow.NewPollerWithDB(db)                 // from existing *sql.DB
+defer poller.Close()
+
+poller.WithWorkerID("custom-worker").
+    WithLeaseDuration(60 * time.Second).
+    WithPollInterval(5 * time.Second).
+    WithTypePrefixes("billing.%", "media.%")                 // override auto-detection
+
+poller.HandleFunc("billing.invoice.v1", handler)             // function handler
+poller.Handle("billing.payment.v1", &PaymentExecutor{})      // struct handler
+
+poller.Start(ctx)
+```
+
+### Workflow (All-in-One)
+
+Combines Client + Poller in a single object — ideal for small services or getting started.
+
+```go
+wf, err := simpleworkflow.New("sqlite:///tmp/workflow.db")
+wf := simpleworkflow.NewWithDB(db, dialect)
+defer wf.Close()
+
+wf.HandleFunc("demo.hello.v1", handler)
+runID, err := wf.Submit("demo.hello.v1", payload).Execute(ctx)
+wf.WithAutoMigrate().Start(ctx)
+```
+
+### WithAutoMigrate
+
+```go
+wf.WithAutoMigrate().Start(ctx)       // on Workflow
+poller.WithAutoMigrate().Start(ctx)   // on Poller
+```
+
+Runs idempotent `CREATE TABLE IF NOT EXISTS` on `Start()`. Works for both SQLite and PostgreSQL.
+
+### Smart Defaults
+
+- **Worker ID:** `hostname-pid` (e.g., `my-server-12345`)
+- **Lease duration:** 30 seconds
+- **Poll interval:** 2 seconds
+- **Type prefixes:** auto-detected from registered handlers
+- **Schema:** `workflow` (or from `?schema=` parameter)
 
 ### Core Types
 
 #### `Intent`
-
-Used with `Submit()` builder:
 
 ```go
 type Intent struct {
@@ -448,8 +190,6 @@ type Intent struct {
 
 #### `WorkflowRun`
 
-Passed to workflow executors:
-
 ```go
 type WorkflowRun struct {
     ID          string
@@ -457,20 +197,12 @@ type WorkflowRun struct {
     Payload     []byte
     Attempt     int
     MaxAttempts int
-
-    // Functions for long-running workflows
-    Heartbeat    HeartbeatFunc          // Extend the lease
-    IsCancelled  CancellationCheckFunc  // Check if cancelled
+    Heartbeat    HeartbeatFunc         // Extend the lease
+    IsCancelled  CancellationCheckFunc // Check if cancelled
 }
-
-// Function types
-type HeartbeatFunc func(ctx context.Context, duration time.Duration) error
-type CancellationCheckFunc func(ctx context.Context) (bool, error)
 ```
 
 #### `WorkflowExecutor`
-
-Interface for stateful executors (optional, can use functions instead):
 
 ```go
 type WorkflowExecutor interface {
@@ -478,60 +210,37 @@ type WorkflowExecutor interface {
 }
 ```
 
-## Workflow Naming & Type-Prefix Routing
+## Type-Prefix Routing
 
-All workflows must be versioned using dotted notation:
-
-```
-<domain>.<subdomain>.<action>.vN
-```
-
-Examples:
-- `content.thumbnail.v1`
-- `content.ocr.v1`
-- `notify.email.v1`
-- `billing.invoice.v1`
-- `billing.payment.v1`
-
-**Type-Prefix Routing** allows workers to claim workflows by pattern:
+Workers claim workflows by pattern using SQL `LIKE`:
 
 ```go
-// This worker handles all billing workflows
-poller.WithTypePrefixes("billing.%")
-
-// Or type prefixes are auto-detected from registered handlers:
 poller.HandleFunc("billing.invoice.v1", invoiceHandler)
 poller.HandleFunc("billing.payment.v1", paymentHandler)
 // → auto-detects "billing.%" prefix
-```
 
-Rules:
-- Never change behavior without bumping `vN`
-- Old workflow runs must remain executable
-- Use prefixes for logical partitioning (e.g., `billing.%`, `media.%`)
+poller.WithTypePrefixes("billing.%") // or set explicitly
+```
 
 ## Failure & Retry
 
-- Failed workflow runs automatically retry with exponential backoff **with jitter** (prevents thundering herd)
-- After `max_attempts`, runs move to `failed` status (was `deadletter`)
+- Failed runs automatically retry with exponential backoff and jitter
+- After `max_attempts`, runs move to `failed` status
 - If a worker crashes, the lease expires and another worker retries
-- Workers can extend their lease using `Heartbeat()` for long-running jobs
 
 ```
 Attempt 1: immediate
-Attempt 2: +1 minute (+10% jitter)
-Attempt 3: +4 minutes (+10% jitter)
+Attempt 2: +1 minute (±10% jitter)
+Attempt 3: +4 minutes (±10% jitter)
 Attempt 4: failed (permanent)
 ```
 
-## Long-Running Workflows
+## Heartbeat & Cancellation
 
-For workflows that take longer than the lease duration:
+For workflows that outlast the lease duration, extend the lease periodically. Check for cancellation to stop gracefully.
 
-**Go:**
 ```go
-func (e *Executor) Execute(ctx context.Context, run *simpleworkflow.WorkflowRun) (interface{}, error) {
-    // Start a goroutine to periodically extend the lease
+func (e *Executor) Execute(ctx context.Context, run *simpleworkflow.WorkflowRun) (any, error) {
     done := make(chan struct{})
     defer close(done)
 
@@ -548,45 +257,20 @@ func (e *Executor) Execute(ctx context.Context, run *simpleworkflow.WorkflowRun)
         }
     }()
 
-    // Do long-running work...
-    time.Sleep(2 * time.Minute)
-
-    return result, nil
-}
-```
-
-**Python:**
-```python
-def execute(self, run: WorkflowRun):
-    # Extend lease before long operation
-    run.heartbeat(60)  # Extend by 60 seconds
-
-    # Do long-running work...
-    time.sleep(120)
-
-    return result
-```
-
-## Cooperative Cancellation
-
-Cancel a workflow run gracefully:
-
-**Producer:**
-```go
-err := client.Cancel(ctx, runID)
-```
-
-**Worker:**
-```go
-func (e *Executor) Execute(ctx context.Context, run *simpleworkflow.WorkflowRun) (interface{}, error) {
     // Check for cancellation periodically
     if cancelled, _ := run.IsCancelled(ctx); cancelled {
         return nil, fmt.Errorf("workflow cancelled")
     }
 
-    // Continue work...
+    // Do long-running work...
     return result, nil
 }
+```
+
+Cancel from the producer side:
+
+```go
+err := client.Cancel(ctx, runID)
 ```
 
 ## Database Schema
@@ -596,233 +280,23 @@ func (e *Executor) Execute(ctx context.Context, run *simpleworkflow.WorkflowRun)
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | UUID | Primary key |
-| `type` | TEXT | Workflow type (e.g. `content.thumbnail.v1`) - **RENAMED from `name`** |
+| `type` | TEXT | Workflow type (e.g. `content.thumbnail.v1`) |
 | `payload` | JSONB | Workflow arguments |
-| `status` | TEXT | `pending`, `leased`, `succeeded`, `failed`, `cancelled` - **UPDATED** |
+| `status` | TEXT | `pending`, `leased`, `succeeded`, `failed`, `cancelled` |
 | `priority` | INT | Lower executes first (default: 100) |
-| `run_at` | TIMESTAMPTZ | Earliest execution time - **RENAMED from `run_after`** |
+| `run_at` | TIMESTAMPTZ | Earliest execution time |
 | `idempotency_key` | TEXT | Unique deduplication key |
-| `attempt` | INT | Number of execution attempts - **RENAMED from `attempt_count`** |
+| `attempt` | INT | Current attempt number |
 | `max_attempts` | INT | Retry limit (default: 3) |
-| `leased_by` | TEXT | Worker ID - **RENAMED from `claimed_by`** |
-| `lease_until` | TIMESTAMPTZ | Lease expiration - **RENAMED from `lease_expires_at`** |
+| `leased_by` | TEXT | Worker ID holding the lease |
+| `lease_until` | TIMESTAMPTZ | Lease expiration |
 | `last_error` | TEXT | Most recent error message |
 | `result` | JSONB | Workflow result |
 | `created_at` | TIMESTAMPTZ | Run creation time |
 | `updated_at` | TIMESTAMPTZ | Last update time |
-| `deleted_at` | TIMESTAMPTZ | Soft delete timestamp (NULL = active) |
+| `deleted_at` | TIMESTAMPTZ | Soft delete (NULL = active) |
 
-**Indexes:**
-- `idx_workflow_run_claim`: On `(status, run_at, priority, created_at)` for efficient claiming
-- `idx_workflow_run_type_prefix`: On `(type text_pattern_ops, status, run_at)` for type-prefix routing - **NEW**
-- `idx_workflow_run_idempotency`: On `(idempotency_key)` for deduplication
-- `idx_workflow_run_type_status`: On `(type, status, created_at DESC)` for monitoring
-- `idx_workflow_run_deleted_at`: On `(deleted_at)` for soft delete queries
-
-### `workflow_event` (NEW)
-
-Audit trail of all workflow run lifecycle events.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | BIGSERIAL | Primary key |
-| `workflow_id` | UUID | Reference to `workflow_run.id` |
-| `event_type` | TEXT | Event type: `created`, `leased`, `started`, `heartbeat`, `succeeded`, `failed`, `retried`, `cancelled` |
-| `data` | JSONB | Additional event metadata |
-| `created_at` | TIMESTAMPTZ | Event timestamp |
-
-**Indexes:**
-- `idx_workflow_event_workflow_id`: On `(workflow_id, created_at DESC)` for querying by workflow
-- `idx_workflow_event_type`: On `(event_type, created_at DESC)` for analytics
-
-**Example queries:**
-```sql
--- Get all events for a workflow run
-SELECT event_type, data, created_at
-FROM workflow_event
-WHERE workflow_id = 'run-uuid'
-ORDER BY created_at;
-
--- Count events by type
-SELECT event_type, COUNT(*)
-FROM workflow_event
-GROUP BY event_type;
-```
-
-### `workflow_registry`
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `workflow_name` | TEXT | Primary key (e.g. `content.thumbnail.v1`) |
-| `runtime` | TEXT | `go` or `python` |
-| `is_enabled` | BOOLEAN | Whether workflow is enabled |
-| `description` | TEXT | Human-readable description |
-
-## Design Principles
-
-### 1. System of record for intent, not an execution engine
-
-This library records **what should happen** — it does not orchestrate how it happens. There is no scheduler, no DAG planner, no central coordinator. PostgreSQL is the single source of truth. Workers are just processes that poll a table.
-
-### 2. Producers never depend on workers
-
-**Producers**:
-- Insert intents (record what needs to happen)
-- Optionally query status
-- Never call workers, never know which language runs the work
-
-**Workers**:
-- Poll for pending intent
-- Execute logic
-- Report results back to the same table
-
-### 3. Execution runtime is an implementation detail
-
-The same intent may be fulfilled by Go today, Python tomorrow. Producers never care. The `workflow_run` table is the contract — everything else is pluggable.
-
-## Makefile Commands
-
-The project includes a Makefile for convenient database migration management:
-
-```bash
-# Show all available commands
-make help
-
-# Database Migrations
-make migrate-up         # Apply all pending migrations
-make migrate-down       # Rollback the last migration
-make migrate-status     # Show current migration status
-make migrate-reset      # Rollback all and reapply (WARNING: destructive)
-make migrate-create NAME=my_migration  # Create a new migration file
-
-# Build and Test
-make build             # Build the library
-make test              # Run integration tests
-make clean             # Clean build artifacts
-```
-
-### Environment Variables
-
-Override database connection settings:
-
-```bash
-# Default values
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=postgres
-DB_PASSWORD=postgres
-DB_NAME=workflow
-DB_SSLMODE=disable
-
-# Example with custom values
-make migrate-up DB_USER=myuser DB_PASSWORD=mypass DB_NAME=production
-```
-
-### Common Workflows
-
-**Initial Setup:**
-```bash
-make migrate-up
-make migrate-status
-```
-
-**Development Iteration:**
-```bash
-# Create new migration
-make migrate-create NAME=add_new_feature
-
-# Edit the generated migration file
-# migrations/YYYYMMDDHHMMSS_add_new_feature.sql
-
-# Apply it
-make migrate-up
-```
-
-**Rollback and Retry:**
-```bash
-# Rollback last migration
-make migrate-down
-
-# Make fixes to the migration file
-# Reapply
-make migrate-up
-```
-
-## Monitoring
-
-Query workflow status:
-
-```sql
--- Count by status
-SELECT status, COUNT(*) FROM workflow.workflow_run GROUP BY status;
-
--- Recent failures
-SELECT type, last_error, created_at, attempt
-FROM workflow.workflow_run
-WHERE status = 'failed'
-ORDER BY created_at DESC
-LIMIT 10;
-
--- Permanently failed workflows
-SELECT * FROM workflow.workflow_run WHERE status = 'failed';
-
--- Cancelled workflows
-SELECT * FROM workflow.workflow_run WHERE status = 'cancelled';
-
--- Workflow runs by type prefix (e.g., all billing workflows)
-SELECT type, status, COUNT(*)
-FROM workflow.workflow_run
-WHERE type LIKE 'billing.%'
-GROUP BY type, status;
-
--- Recent workflow events
-SELECT w.type, e.event_type, e.data, e.created_at
-FROM workflow.workflow_event e
-JOIN workflow.workflow_run w ON e.workflow_id = w.id
-ORDER BY e.created_at DESC
-LIMIT 20;
-
--- Workflows with heartbeats (long-running)
-SELECT w.id, w.type, COUNT(*) as heartbeat_count
-FROM workflow.workflow_event e
-JOIN workflow.workflow_run w ON e.workflow_id = w.id
-WHERE e.event_type = 'heartbeat'
-GROUP BY w.id, w.type
-ORDER BY heartbeat_count DESC;
-```
-
-## Prometheus Metrics
-
-The library exports Prometheus metrics for observability:
-
-**Workflow Run Metrics:**
-- `workflow_run_claimed_total{workflow_type, worker_id}` - Total runs claimed
-- `workflow_run_completed_total{workflow_type, worker_id, status}` - Total runs completed
-- `workflow_run_failed_total{workflow_type, worker_id}` - Total runs permanently failed
-- `workflow_run_failed_attempts_total{workflow_type, worker_id, attempt}` - Failed attempts
-- `workflow_run_execution_duration_seconds{workflow_type, worker_id, status}` - Execution duration histogram
-
-**Worker Metrics:**
-- `workflow_worker_poll_cycle_total{worker_id}` - Total poll cycles
-- `workflow_worker_poll_errors_total{worker_id, error_type}` - Poll errors
-- `workflow_run_queue_depth{workflow_type, status}` - Queue depth gauge
-- `workflow_worker_uptime_seconds{worker_id}` - Worker uptime
-- `workflow_worker_last_poll_timestamp{worker_id}` - Last poll timestamp
-
-**Example Prometheus queries:**
-```promql
-# Rate of successful workflow completions
-rate(workflow_run_completed_total{status="succeeded"}[5m])
-
-# Failed workflow rate by type
-rate(workflow_run_failed_total[5m])
-
-# P95 execution duration
-histogram_quantile(0.95, rate(workflow_run_execution_duration_seconds_bucket[5m]))
-
-# Queue depth by workflow type
-workflow_run_queue_depth{status="pending"}
-```
+`workflow_event` stores an audit trail of all lifecycle events (created, leased, succeeded, failed, etc.). `workflow_registry` tracks registered workflow types and their runtime.
 
 ## License
 
