@@ -4,9 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,6 +33,8 @@ type Poller struct {
 	metrics          MetricsCollector // Optional: metrics collector for observability
 	startTime        time.Time        // Worker start time for uptime calculation
 	autoDetectPrefix bool             // true if type prefixes should be auto-detected from handlers
+
+	wg sync.WaitGroup // tracks in-flight executions for graceful shutdown
 
 	// Schedule ticker (optional, enabled via WithScheduleTicker)
 	scheduleTicker         *ScheduleTicker
@@ -185,7 +188,8 @@ func (p *Poller) Start(ctx context.Context) {
 
 	// Validate that at least one handler is registered
 	if len(p.executors) == 0 {
-		log.Fatal("No workflow handlers registered. Use Handle() or HandleFunc() to register handlers.")
+		slog.Error("no workflow handlers registered, use Handle() or HandleFunc() to register handlers")
+		os.Exit(1)
 	}
 
 	// Start schedule ticker goroutine if enabled
@@ -193,14 +197,17 @@ func (p *Poller) Start(ctx context.Context) {
 		if p.scheduleTicker == nil {
 			p.scheduleTicker = newScheduleTickerFromDB(p.db, p.dialect)
 		}
+		if p.metrics != nil {
+			p.scheduleTicker.SetMetrics(p.metrics)
+		}
 		go p.scheduleTicker.Start(ctx)
-		log.Printf("Embedded schedule ticker started (interval: %s)", p.scheduleTicker.tickInterval)
+		slog.Info("embedded schedule ticker started", "interval", p.scheduleTicker.tickInterval)
 	}
 
 	ticker := time.NewTicker(p.pollInterval)
 	defer ticker.Stop()
 
-	log.Printf("Workflow poller started, watching type prefixes: %v", p.typePrefixes)
+	slog.Info("workflow poller started", "type_prefixes", p.typePrefixes)
 
 	for {
 		select {
@@ -210,11 +217,13 @@ func (p *Poller) Start(ctx context.Context) {
 			if p.scheduleTicker != nil {
 				p.scheduleTicker.Stop()
 			}
+			p.wg.Wait()
 			return
 		case <-ctx.Done():
 			if p.scheduleTicker != nil {
 				p.scheduleTicker.Stop()
 			}
+			p.wg.Wait()
 			return
 		}
 	}
@@ -272,7 +281,7 @@ func (p *Poller) pollAndExecute(ctx context.Context) {
 		if p.metrics != nil {
 			p.metrics.RecordPollError(p.workerID, classifyError(err))
 		}
-		log.Printf("Failed to claim workflow run: %v", err)
+		slog.Error("failed to claim workflow run", "error", err)
 		return
 	}
 	if run == nil {
@@ -288,9 +297,11 @@ func (p *Poller) pollAndExecute(ctx context.Context) {
 		p.metrics.RecordIntentClaimed(run.Type, p.workerID)
 	}
 
-	log.Printf("Claimed workflow run: %s (type: %s)", run.ID, run.Type)
+	slog.Info("claimed workflow run", "run_id", run.ID, "type", run.Type)
 
 	// Execute the workflow
+	p.wg.Add(1)
+	defer p.wg.Done()
 	p.executeRun(ctx, run, executionStart)
 }
 
@@ -334,9 +345,9 @@ func (p *Poller) executeRun(ctx context.Context, run *WorkflowRun, executionStar
 
 func (p *Poller) markRunSucceeded(ctx context.Context, run *WorkflowRun, result any, executionStart time.Time) {
 	if err := p.runs.MarkSucceeded(ctx, run.ID, result); err != nil {
-		log.Printf("%v", err)
+		slog.Error("failed to mark workflow run as succeeded", "run_id", run.ID, "error", err)
 	} else {
-		log.Printf("Workflow run %s succeeded", run.ID)
+		slog.Info("workflow run succeeded", "run_id", run.ID)
 	}
 
 	// Record metrics

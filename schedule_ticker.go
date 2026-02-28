@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -19,6 +19,7 @@ type ScheduleTicker struct {
 	sched        *ScheduleRepository
 	tickInterval time.Duration
 	stopCh       chan struct{}
+	metrics      MetricsCollector
 }
 
 // NewScheduleTicker creates a new ScheduleTicker from a connection string.
@@ -60,6 +61,11 @@ func newScheduleTickerFromDB(db *sql.DB, dialect Dialect) *ScheduleTicker {
 	}
 }
 
+// SetMetrics sets the metrics collector for the schedule ticker (optional).
+func (t *ScheduleTicker) SetMetrics(m MetricsCollector) {
+	t.metrics = m
+}
+
 // WithTickInterval sets how often the ticker checks for due schedules.
 // Default: 15 seconds
 func (t *ScheduleTicker) WithTickInterval(d time.Duration) *ScheduleTicker {
@@ -72,13 +78,19 @@ func (t *ScheduleTicker) Start(ctx context.Context) {
 	ticker := time.NewTicker(t.tickInterval)
 	defer ticker.Stop()
 
-	log.Printf("Schedule ticker started (interval: %s)", t.tickInterval)
+	slog.Info("schedule ticker started", "interval", t.tickInterval)
 
 	for {
 		select {
 		case <-ticker.C:
+			if t.metrics != nil {
+				t.metrics.RecordPollCycle("schedule-ticker")
+			}
 			if err := t.Tick(ctx); err != nil {
-				log.Printf("Schedule tick error: %v", err)
+				slog.Error("schedule tick error", "error", err)
+				if t.metrics != nil {
+					t.metrics.RecordPollError("schedule-ticker", "tick_error")
+				}
 			}
 		case <-t.stopCh:
 			return
@@ -134,19 +146,19 @@ func (t *ScheduleTicker) Tick(ctx context.Context) error {
 		}
 
 		if returnedID != "" {
-			log.Printf("Schedule %s fired: created workflow_run %s (key: %s)", s.ID, returnedID, idempotencyKey)
+			slog.Info("schedule fired", "schedule_id", s.ID, "run_id", returnedID, "idempotency_key", idempotencyKey)
 		}
 
 		// Compute next fire time
 		loc, err := time.LoadLocation(s.Timezone)
 		if err != nil {
-			log.Printf("Invalid timezone %q for schedule %s, using UTC", s.Timezone, s.ID)
+			slog.Warn("invalid timezone, using UTC", "timezone", s.Timezone, "schedule_id", s.ID)
 			loc = time.UTC
 		}
 
 		sched, err := cronParser.Parse(s.CronExpr)
 		if err != nil {
-			log.Printf("Invalid cron expression %q for schedule %s: %v", s.CronExpr, s.ID, err)
+			slog.Warn("invalid cron expression", "cron", s.CronExpr, "schedule_id", s.ID, "error", err)
 			continue
 		}
 

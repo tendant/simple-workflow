@@ -4,13 +4,21 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
+)
+
+var (
+	// ErrNotFound is returned when a resource does not exist or is not in the expected state.
+	ErrNotFound = errors.New("not found")
+	// ErrAlreadyComplete is returned when a workflow run cannot be cancelled because it is already completed.
+	ErrAlreadyComplete = errors.New("workflow run not found or already completed")
 )
 
 // queryer is the common interface satisfied by both *sql.DB and *sql.Tx.
@@ -24,6 +32,15 @@ type queryer interface {
 type dbHelper struct {
 	db      *sql.DB
 	dialect Dialect
+	tx      *sql.Tx
+}
+
+// queryer returns the tx if set, otherwise the db.
+func (h *dbHelper) queryer() queryer {
+	if h.tx != nil {
+		return h.tx
+	}
+	return h.db
 }
 
 // rewrite converts $N placeholders to ? for SQLite, or returns as-is for PostgreSQL.
@@ -121,13 +138,14 @@ func scanWorkflowRun(scanner interface{ Scan(dest ...any) error }) (*WorkflowRun
 }
 
 // requireOneRow checks that an exec result affected exactly one row.
-func requireOneRow(result sql.Result, notFoundMsg string) error {
+// If no rows were affected, it returns the provided sentinel error.
+func requireOneRow(result sql.Result, sentinel error) error {
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rowsAffected == 0 {
-		return fmt.Errorf("%s", notFoundMsg)
+		return sentinel
 	}
 	return nil
 }
@@ -139,7 +157,6 @@ func requireOneRow(result sql.Result, notFoundMsg string) error {
 // RunRepository encapsulates all data access for the workflow_run table.
 type RunRepository struct {
 	dbHelper
-	tx *sql.Tx
 }
 
 // NewRunRepository creates a RunRepository from a db and dialect.
@@ -149,15 +166,9 @@ func NewRunRepository(db *sql.DB, dialect Dialect) *RunRepository {
 
 // WithTx returns a copy of the repository that executes queries within the given transaction.
 func (r *RunRepository) WithTx(tx *sql.Tx) *RunRepository {
-	return &RunRepository{dbHelper: r.dbHelper, tx: tx}
-}
-
-// queryer returns the tx if set, otherwise the db.
-func (r *RunRepository) queryer() queryer {
-	if r.tx != nil {
-		return r.tx
-	}
-	return r.db
+	cp := *r
+	cp.tx = tx
+	return &cp
 }
 
 // Create inserts a new workflow run and returns the ID. Returns "" if idempotency conflict.
@@ -220,7 +231,7 @@ func (r *RunRepository) Cancel(ctx context.Context, runID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to cancel workflow run: %w", err)
 	}
-	if err := requireOneRow(result, "workflow run not found or already completed"); err != nil {
+	if err := requireOneRow(result, ErrAlreadyComplete); err != nil {
 		return err
 	}
 
@@ -391,9 +402,9 @@ func (r *RunRepository) MarkFailed(ctx context.Context, run *WorkflowRun, execEr
 	`, r.dialect.Now()))
 	_, err := r.queryer().ExecContext(ctx, query, status, newAttempt, runAt, execErr.Error(), run.ID)
 	if err != nil {
-		log.Printf("Failed to mark workflow run %s as failed: %v", run.ID, err)
+		slog.Error("failed to mark workflow run as failed", "run_id", run.ID, "error", err)
 	} else {
-		log.Printf("Workflow run %s failed (attempt %d/%d): %v", run.ID, newAttempt, run.MaxAttempts, execErr)
+		slog.Info("workflow run failed", "run_id", run.ID, "attempt", newAttempt, "max_attempts", run.MaxAttempts, "error", execErr)
 	}
 
 	eventType := "retried"
@@ -445,7 +456,7 @@ func (r *RunRepository) ExtendLease(ctx context.Context, runID string, duration 
 	if err != nil {
 		return fmt.Errorf("failed to extend lease: %w", err)
 	}
-	if err := requireOneRow(result, "workflow run not found or not in leased state"); err != nil {
+	if err := requireOneRow(result, fmt.Errorf("extend lease: %w", ErrNotFound)); err != nil {
 		return err
 	}
 
@@ -502,7 +513,6 @@ func (r *RunRepository) CreateFromSchedule(ctx context.Context, typ string, payl
 // ScheduleRepository encapsulates all data access for the workflow_schedule table.
 type ScheduleRepository struct {
 	dbHelper
-	tx *sql.Tx
 }
 
 // NewScheduleRepository creates a ScheduleRepository from a db and dialect.
@@ -512,15 +522,9 @@ func NewScheduleRepository(db *sql.DB, dialect Dialect) *ScheduleRepository {
 
 // WithTx returns a copy of the repository that executes queries within the given transaction.
 func (r *ScheduleRepository) WithTx(tx *sql.Tx) *ScheduleRepository {
-	return &ScheduleRepository{dbHelper: r.dbHelper, tx: tx}
-}
-
-// queryer returns the tx if set, otherwise the db.
-func (r *ScheduleRepository) queryer() queryer {
-	if r.tx != nil {
-		return r.tx
-	}
-	return r.db
+	cp := *r
+	cp.tx = tx
+	return &cp
 }
 
 // Create validates and inserts a new schedule. Returns the schedule ID.
@@ -581,7 +585,7 @@ func (r *ScheduleRepository) SetEnabled(ctx context.Context, scheduleID string, 
 	if err != nil {
 		return fmt.Errorf("failed to update schedule: %w", err)
 	}
-	return requireOneRow(result, "schedule not found")
+	return requireOneRow(result, fmt.Errorf("set enabled: %w", ErrNotFound))
 }
 
 // SoftDelete soft-deletes a schedule.
@@ -596,7 +600,7 @@ func (r *ScheduleRepository) SoftDelete(ctx context.Context, scheduleID string) 
 	if err != nil {
 		return fmt.Errorf("failed to delete schedule: %w", err)
 	}
-	return requireOneRow(result, "schedule not found")
+	return requireOneRow(result, fmt.Errorf("soft delete: %w", ErrNotFound))
 }
 
 // List returns all active (non-deleted) schedules.
