@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -19,6 +20,7 @@ type ScheduleTicker struct {
 	sched        *ScheduleRepository
 	tickInterval time.Duration
 	stopCh       chan struct{}
+	stopOnce     sync.Once
 	metrics      MetricsCollector
 }
 
@@ -100,9 +102,9 @@ func (t *ScheduleTicker) Start(ctx context.Context) {
 	}
 }
 
-// Stop stops the ticker loop.
+// Stop stops the ticker loop. Safe to call multiple times.
 func (t *ScheduleTicker) Stop() {
-	close(t.stopCh)
+	t.stopOnce.Do(func() { close(t.stopCh) })
 }
 
 // Close closes the database connection (only for standalone tickers).

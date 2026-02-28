@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -384,7 +385,7 @@ func (r *RunRepository) MarkFailed(ctx context.Context, run *WorkflowRun, execEr
 	status := "pending"
 
 	baseDelay := time.Duration(newAttempt*newAttempt) * time.Minute
-	jitter := time.Duration(float64(baseDelay) * 0.1)
+	jitter := time.Duration(float64(baseDelay) * 0.1 * rand.Float64())
 	runAt := time.Now().Add(baseDelay + jitter)
 
 	if newAttempt >= run.MaxAttempts {

@@ -30,6 +30,7 @@ type Poller struct {
 	leaseDuration    time.Duration
 	workerID         string
 	stopCh           chan struct{}
+	stopOnce         sync.Once
 	metrics          MetricsCollector // Optional: metrics collector for observability
 	startTime        time.Time        // Worker start time for uptime calculation
 	autoDetectPrefix bool             // true if type prefixes should be auto-detected from handlers
@@ -262,9 +263,9 @@ func (p *Poller) detectTypePrefixes() []string {
 	return prefixes
 }
 
-// Stop stops the poller
+// Stop stops the poller. Safe to call multiple times.
 func (p *Poller) Stop() {
-	close(p.stopCh)
+	p.stopOnce.Do(func() { close(p.stopCh) })
 }
 
 func (p *Poller) pollAndExecute(ctx context.Context) {
