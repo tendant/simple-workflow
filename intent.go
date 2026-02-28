@@ -246,14 +246,15 @@ func (c *Client) GetWorkflowRun(ctx context.Context, id string) (*WorkflowRunSta
 
 	var run WorkflowRunStatus
 	var idempotencyKey, leasedBy, lastError sql.NullString
-	var leaseUntil sql.NullTime
+	var leaseUntilStr sql.NullString
+	var runAtStr, createdAtStr, updatedAtStr string
 	var result []byte
 
 	err := c.db.QueryRowContext(ctx, query, id).Scan(
-		&run.ID, &run.Type, &run.Payload, &run.Status, &run.Priority, &run.RunAt,
+		&run.ID, &run.Type, &run.Payload, &run.Status, &run.Priority, &runAtStr,
 		&idempotencyKey, &run.Attempt, &run.MaxAttempts,
-		&leasedBy, &leaseUntil, &lastError, &result,
-		&run.CreatedAt, &run.UpdatedAt,
+		&leasedBy, &leaseUntilStr, &lastError, &result,
+		&createdAtStr, &updatedAtStr,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -262,14 +263,19 @@ func (c *Client) GetWorkflowRun(ctx context.Context, id string) (*WorkflowRunSta
 		return nil, fmt.Errorf("failed to get workflow run: %w", err)
 	}
 
+	run.RunAt, _ = parseTimestamp(runAtStr)
+	run.CreatedAt, _ = parseTimestamp(createdAtStr)
+	run.UpdatedAt, _ = parseTimestamp(updatedAtStr)
+
 	if idempotencyKey.Valid {
 		run.IdempotencyKey = &idempotencyKey.String
 	}
 	if leasedBy.Valid {
 		run.LeasedBy = &leasedBy.String
 	}
-	if leaseUntil.Valid {
-		run.LeaseUntil = &leaseUntil.Time
+	if leaseUntilStr.Valid {
+		t, _ := parseTimestamp(leaseUntilStr.String)
+		run.LeaseUntil = &t
 	}
 	if lastError.Valid {
 		run.LastError = &lastError.String
@@ -316,17 +322,22 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, opts ListOptions) ([]Work
 	for rows.Next() {
 		var run WorkflowRunStatus
 		var idempotencyKey, leasedBy, lastError sql.NullString
-		var leaseUntil sql.NullTime
+		var leaseUntilStr sql.NullString
+		var runAtStr, createdAtStr, updatedAtStr string
 		var result []byte
 
 		if err := rows.Scan(
-			&run.ID, &run.Type, &run.Payload, &run.Status, &run.Priority, &run.RunAt,
+			&run.ID, &run.Type, &run.Payload, &run.Status, &run.Priority, &runAtStr,
 			&idempotencyKey, &run.Attempt, &run.MaxAttempts,
-			&leasedBy, &leaseUntil, &lastError, &result,
-			&run.CreatedAt, &run.UpdatedAt,
+			&leasedBy, &leaseUntilStr, &lastError, &result,
+			&createdAtStr, &updatedAtStr,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan workflow run: %w", err)
 		}
+
+		run.RunAt, _ = parseTimestamp(runAtStr)
+		run.CreatedAt, _ = parseTimestamp(createdAtStr)
+		run.UpdatedAt, _ = parseTimestamp(updatedAtStr)
 
 		if idempotencyKey.Valid {
 			run.IdempotencyKey = &idempotencyKey.String
@@ -334,8 +345,9 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, opts ListOptions) ([]Work
 		if leasedBy.Valid {
 			run.LeasedBy = &leasedBy.String
 		}
-		if leaseUntil.Valid {
-			run.LeaseUntil = &leaseUntil.Time
+		if leaseUntilStr.Valid {
+			t, _ := parseTimestamp(leaseUntilStr.String)
+			run.LeaseUntil = &t
 		}
 		if lastError.Valid {
 			run.LastError = &lastError.String
@@ -359,4 +371,21 @@ func (c *Client) DB() *sql.DB {
 // Dialect returns the dialect used by this client.
 func (c *Client) Dialect() Dialect {
 	return c.dialect
+}
+
+// parseTimestamp parses a timestamp string from either PostgreSQL or SQLite format.
+func parseTimestamp(s string) (time.Time, error) {
+	// Try RFC3339 first (PostgreSQL with timezone)
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, nil
+	}
+	// SQLite datetime('now') format: "2006-01-02 15:04:05"
+	if t, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+		return t.UTC(), nil
+	}
+	// SQLite with fractional seconds
+	if t, err := time.Parse("2006-01-02T15:04:05Z", s); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("cannot parse timestamp: %q", s)
 }
