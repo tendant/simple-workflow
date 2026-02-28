@@ -4,6 +4,10 @@ This directory contains working examples demonstrating the key features of simpl
 
 ## Prerequisites
 
+**For SQLite examples** (e.g., `sqlite-worker`): no setup needed — just `go run`.
+
+**For PostgreSQL examples** (e.g., `basic-worker`, `billing-worker`):
+
 1. **PostgreSQL Database**
    ```bash
    # Start PostgreSQL (if using Docker)
@@ -55,6 +59,30 @@ VALUES ('content.thumbnail.v1', '{\"content_id\": \"img123\", \"width\": 300, \"
 Starting thumbnail worker...
 Generating thumbnail for content img123 (300x200)
 Thumbnail completed for content img123
+```
+
+---
+
+### SQLite Worker (`go/sqlite-worker/main.go`)
+
+**What it demonstrates:**
+- All-in-one `Workflow` API (producer + worker in one object)
+- SQLite backend — no PostgreSQL needed
+- `AutoMigrate()` — creates tables without external migration tools
+- Fluent `Submit().Execute()` builder
+
+**Run it:**
+```bash
+cd examples/go/sqlite-worker
+go run main.go
+```
+
+No database setup required — SQLite creates the file automatically.
+
+**Expected output:**
+```
+Submitted workflow run: <uuid>
+Processing: Hello from SQLite!
 ```
 
 ---
@@ -214,9 +242,9 @@ Workers claim workflows based on type prefixes using SQL `LIKE` patterns:
 
 ```go
 // Go: Worker handles all billing workflows
-config := simpleworkflow.PollerConfig{
-    TypePrefixes: []string{"billing.%"},
-}
+poller.WithTypePrefixes("billing.%")
+
+// Or type prefixes are auto-detected from registered handlers
 ```
 
 ```python
@@ -252,6 +280,22 @@ def execute(self, run: WorkflowRun):
             raise Exception("Workflow cancelled")
         process_chunk(i)
 ```
+
+### Schema Migration with `WithAutoMigrate()`
+
+For quick setup (especially with SQLite), use embedded DDL instead of external migration tools:
+
+```go
+// Auto-migrate on Start()
+wf.WithAutoMigrate().Start(ctx)
+poller.WithAutoMigrate().Start(ctx)
+
+// Or migrate explicitly
+wf.AutoMigrate(ctx)
+client.AutoMigrate(ctx)
+```
+
+For production PostgreSQL, use version-controlled migrations via `make migrate-up`.
 
 ---
 

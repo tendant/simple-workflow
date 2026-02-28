@@ -50,38 +50,79 @@ pip install -e .
 
 ## Quick Start
 
-### 1. Apply Migrations
+### Simplest: All-in-One with `Workflow`
 
-Apply the SQL migrations to your PostgreSQL database using the Makefile:
+The `Workflow` type combines producer and worker into a single entry point — perfect for getting started:
 
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    simpleworkflow "github.com/tendant/simple-workflow"
+)
+
+func main() {
+    wf, err := simpleworkflow.New("sqlite:///tmp/workflow.db")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer wf.Close()
+
+    // Register a handler
+    wf.HandleFunc("demo.hello.v1", func(ctx context.Context, run *simpleworkflow.WorkflowRun) (any, error) {
+        log.Printf("Hello! payload=%s", run.Payload)
+        return map[string]string{"status": "done"}, nil
+    })
+
+    ctx := context.Background()
+
+    // Submit a workflow run
+    runID, _ := wf.Submit("demo.hello.v1", map[string]string{"msg": "hi"}).Execute(ctx)
+    log.Printf("Submitted: %s", runID)
+
+    // WithAutoMigrate() creates tables on first Start() — no external migration tool needed
+    wf.WithAutoMigrate().Start(ctx)
+}
+```
+
+`WithAutoMigrate()` runs embedded DDL on `Start()`, so there's no need for `goose` or `make migrate-up` when getting started. Works for both SQLite and PostgreSQL.
+
+### Migrations
+
+There are two paths for schema management:
+
+**Embedded DDL (recommended for getting started):**
+```go
+// Option A: auto-migrate on Start()
+wf.WithAutoMigrate().Start(ctx)
+
+// Option B: migrate explicitly
+wf.AutoMigrate(ctx)
+
+// Also works on Client and Poller individually
+client.AutoMigrate(ctx)
+poller.AutoMigrate(ctx)
+```
+
+This works for both SQLite and PostgreSQL — no external tools needed.
+
+**Version-controlled migrations (recommended for production PostgreSQL):**
 ```bash
-# Show help
-make help
-
-# Configure database credentials (recommended)
-cp .env.example .env
-# Edit .env with your database credentials
-
-# Apply all migrations (uses .env or defaults: localhost, postgres user, workflow db)
+# Using goose via Makefile
 make migrate-up
 
-# Check migration status
+# Or directly
+goose -dir migrations postgres "host=localhost user=postgres dbname=workflow password=postgres sslmode=disable search_path=workflow" up
+
+# Check status / rollback
 make migrate-status
-
-# Override .env with command line arguments
-make migrate-up DB_HOST=myhost DB_USER=myuser DB_PASSWORD=mypass DB_NAME=mydb
-
-# Rollback last migration
 make migrate-down
 ```
 
-Or manually with goose:
-
-```bash
-goose -dir migrations postgres "host=localhost user=postgres dbname=workflow password=postgres sslmode=disable search_path=workflow" up
-```
-
-### 2. Producer: Create Workflow Runs (Go)
+### 1. Producer: Create Workflow Runs (Go)
 
 The simplified API uses connection strings and fluent builders:
 
@@ -120,7 +161,7 @@ func main() {
 }
 ```
 
-### 3. Worker: Execute Workflow Runs (Go)
+### 2. Worker: Execute Workflow Runs (Go)
 
 The simplified API uses function handlers instead of executor structs:
 
@@ -178,7 +219,7 @@ func main() {
 - ✅ Connection management automatic with `Close()`
 - ✅ Worker ID auto-generated: `hostname-pid`
 
-### 4. Worker: Execute Workflow Runs (Python)
+### 3. Worker: Execute Workflow Runs (Python)
 
 Python workers use the same `workflow_run` table and have similar simplified API:
 
@@ -324,6 +365,68 @@ poller.Start(ctx)
 - Type prefixes: Auto-detected from registered handlers
 - Schema: `workflow` (or from `?schema=` parameter)
 
+#### All-in-One `Workflow` API
+
+Combines producer and worker in a single object — ideal for small services or getting started.
+
+**Create Workflow:**
+```go
+// From connection string (SQLite or PostgreSQL)
+wf, err := simpleworkflow.New("sqlite:///tmp/workflow.db")
+wf, err := simpleworkflow.New("postgres://user:pass@host/db?schema=workflow")
+defer wf.Close()
+
+// Or from existing DB connection
+wf := simpleworkflow.NewWithDB(db, dialect)
+```
+
+**Use it:**
+```go
+// Register handlers (same API as Poller)
+wf.HandleFunc("demo.hello.v1", handler)
+wf.Handle("demo.hello.v1", &MyExecutor{})
+
+// Submit workflows (same API as Client)
+runID, err := wf.Submit("demo.hello.v1", payload).Execute(ctx)
+err := wf.Cancel(ctx, runID)
+
+// Configure (fluent, same options as Poller)
+wf.WithWorkerID("my-worker").WithPollInterval(5 * time.Second)
+
+// Start polling
+wf.WithAutoMigrate().Start(ctx)
+```
+
+#### `WithAutoMigrate()`
+
+Available on both `Poller` and `Workflow`. When enabled, `Start()` automatically runs the embedded DDL before polling begins.
+
+```go
+// On Workflow
+wf.WithAutoMigrate().Start(ctx)
+
+// On Poller
+poller.WithAutoMigrate().Start(ctx)
+```
+
+You can also call `AutoMigrate(ctx)` explicitly on `Client`, `Poller`, or `Workflow`:
+```go
+client.AutoMigrate(ctx)
+poller.AutoMigrate(ctx)
+wf.AutoMigrate(ctx)
+```
+
+Works for both SQLite and PostgreSQL — runs idempotent `CREATE TABLE IF NOT EXISTS` statements.
+
+#### Connection Strings
+
+| Database   | Format | Example |
+|------------|--------|---------|
+| SQLite     | `sqlite://<path>` | `sqlite:///tmp/workflow.db` or `sqlite://:memory:` |
+| PostgreSQL | `postgres://user:pass@host/db?schema=workflow` | `postgres://user:pass@localhost/mydb?schema=workflow` |
+
+The `?schema=` parameter sets the PostgreSQL `search_path` (defaults to `workflow`).
+
 ---
 
 ### Core Types
@@ -394,10 +497,12 @@ Examples:
 
 ```go
 // This worker handles all billing workflows
-config := simpleworkflow.PollerConfig{
-    TypePrefixes: []string{"billing.%"},
-    // ...
-}
+poller.WithTypePrefixes("billing.%")
+
+// Or type prefixes are auto-detected from registered handlers:
+poller.HandleFunc("billing.invoice.v1", invoiceHandler)
+poller.HandleFunc("billing.payment.v1", paymentHandler)
+// → auto-detects "billing.%" prefix
 ```
 
 Rules:
