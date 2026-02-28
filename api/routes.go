@@ -22,6 +22,7 @@ func NewRouter(client *simpleworkflow.Client, apiKey string) *chi.Mux {
 		r.Post("/workflows", h.SubmitWorkflow)
 		r.Get("/workflows", h.ListWorkflows)
 		r.Get("/workflows/{id}", h.GetWorkflow)
+		r.Get("/workflows/{id}/events", h.GetWorkflowEvents)
 		r.Delete("/workflows/{id}", h.CancelWorkflow)
 
 		// Schedules

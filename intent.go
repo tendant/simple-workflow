@@ -153,6 +153,11 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, opts ListOptions) ([]Work
 	return c.runs.List(ctx, opts)
 }
 
+// GetWorkflowEvents returns the audit event log for a workflow run.
+func (c *Client) GetWorkflowEvents(ctx context.Context, runID string) ([]WorkflowEvent, error) {
+	return c.runs.GetEvents(ctx, runID)
+}
+
 // DB returns the underlying database connection.
 // Useful for the REST API layer that needs to pass the db to handler functions.
 func (c *Client) DB() *sql.DB {

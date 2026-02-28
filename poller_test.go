@@ -413,6 +413,74 @@ func TestStartAndStop(t *testing.T) {
 	}
 }
 
+func TestClaimStaleLeasedRun(t *testing.T) {
+	db, dialect := newTestPollerDB(t)
+	poller := newTestPoller(t, db, dialect)
+
+	// Insert a leased run with an expired lease
+	payloadJSON, _ := json.Marshal(map[string]string{"k": "v"})
+	_, err := db.Exec(
+		`INSERT INTO workflow_run (id, type, payload, status, priority, run_at, max_attempts, leased_by, lease_until)
+		 VALUES (?, ?, ?, 'leased', 100, datetime('now'), 3, 'old-worker', datetime('now', '-60 seconds'))`,
+		"run-stale", "test.stale.v1", payloadJSON,
+	)
+	if err != nil {
+		t.Fatalf("insert stale leased run: %v", err)
+	}
+
+	run, err := poller.claimRun(context.Background())
+	if err != nil {
+		t.Fatalf("claimRun: %v", err)
+	}
+	if run == nil {
+		t.Fatal("claimRun returned nil, expected stale leased run to be re-claimed")
+	}
+	if run.ID != "run-stale" {
+		t.Errorf("run.ID = %q, want %q", run.ID, "run-stale")
+	}
+
+	// Verify it's now leased by our worker
+	var status, leasedBy string
+	db.QueryRow("SELECT status, leased_by FROM workflow_run WHERE id = ?", "run-stale").Scan(&status, &leasedBy)
+	if status != "leased" {
+		t.Errorf("status = %q, want %q", status, "leased")
+	}
+	if leasedBy != "test-worker" {
+		t.Errorf("leased_by = %q, want %q", leasedBy, "test-worker")
+	}
+}
+
+func TestClaimActiveLeasedRunNotReclaimed(t *testing.T) {
+	db, dialect := newTestPollerDB(t)
+	poller := newTestPoller(t, db, dialect)
+
+	// Insert a leased run with a valid (future) lease
+	payloadJSON, _ := json.Marshal(nil)
+	_, err := db.Exec(
+		`INSERT INTO workflow_run (id, type, payload, status, priority, run_at, max_attempts, leased_by, lease_until)
+		 VALUES (?, ?, ?, 'leased', 100, datetime('now'), 3, 'active-worker', datetime('now', '+300 seconds'))`,
+		"run-active", "test.active.v1", payloadJSON,
+	)
+	if err != nil {
+		t.Fatalf("insert active leased run: %v", err)
+	}
+
+	run, err := poller.claimRun(context.Background())
+	if err != nil {
+		t.Fatalf("claimRun: %v", err)
+	}
+	if run != nil {
+		t.Errorf("expected nil (active lease should not be re-claimed), got run %+v", run)
+	}
+
+	// Verify it's still leased by the original worker
+	var leasedBy string
+	db.QueryRow("SELECT leased_by FROM workflow_run WHERE id = ?", "run-active").Scan(&leasedBy)
+	if leasedBy != "active-worker" {
+		t.Errorf("leased_by = %q, want %q", leasedBy, "active-worker")
+	}
+}
+
 func TestClassifyError(t *testing.T) {
 	tests := []struct {
 		err  error

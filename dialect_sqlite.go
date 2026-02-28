@@ -34,8 +34,8 @@ func (d *SQLiteDialect) ClaimRunQuery(typeCondition string, leaseSec int) string
 			updated_at = datetime('now')
 		WHERE id = (
 			SELECT id FROM workflow_run
-			WHERE status = 'pending'
-			  AND run_at <= datetime('now')
+			WHERE ((status = 'pending' AND run_at <= datetime('now'))
+			    OR (status = 'leased' AND lease_until < datetime('now')))
 			  AND deleted_at IS NULL
 			  %s
 			ORDER BY priority ASC, created_at ASC

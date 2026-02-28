@@ -507,6 +507,38 @@ func (r *RunRepository) CreateFromSchedule(ctx context.Context, typ string, payl
 	return "", nil
 }
 
+// GetEvents returns all audit events for a workflow run, ordered by creation time.
+func (r *RunRepository) GetEvents(ctx context.Context, runID string) ([]WorkflowEvent, error) {
+	query := r.rewrite(`
+		SELECT id, workflow_id, event_type, data, created_at
+		FROM workflow_event
+		WHERE workflow_id = $1
+		ORDER BY created_at ASC
+	`)
+
+	rows, err := r.queryer().QueryContext(ctx, query, runID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []WorkflowEvent
+	for rows.Next() {
+		var e WorkflowEvent
+		var data []byte
+		var createdAtStr string
+		if err := rows.Scan(&e.ID, &e.WorkflowID, &e.EventType, &data, &createdAtStr); err != nil {
+			return nil, fmt.Errorf("failed to scan event: %w", err)
+		}
+		e.CreatedAt, _ = parseTimestamp(createdAtStr)
+		if data != nil {
+			e.Data = json.RawMessage(data)
+		}
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
 // ---------------------------------------------------------------------------
 // ScheduleRepository
 // ---------------------------------------------------------------------------

@@ -35,8 +35,8 @@ func (d *PostgresDialect) ClaimRunQuery(typeCondition string, leaseSec int) stri
 			updated_at = NOW()
 		WHERE id = (
 			SELECT id FROM workflow_run
-			WHERE status = 'pending'
-			  AND run_at <= NOW()
+			WHERE ((status = 'pending' AND run_at <= NOW())
+			    OR (status = 'leased' AND lease_until < NOW()))
 			  AND deleted_at IS NULL
 			  %s
 			ORDER BY priority ASC, created_at ASC

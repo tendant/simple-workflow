@@ -101,6 +101,20 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, run)
 }
 
+// GetWorkflowEvents handles GET /api/v1/workflows/{id}/events
+func (h *Handler) GetWorkflowEvents(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	events, err := h.client.GetWorkflowEvents(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if events == nil {
+		events = []simpleworkflow.WorkflowEvent{}
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
 // CancelWorkflow handles DELETE /api/v1/workflows/{id}
 func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")

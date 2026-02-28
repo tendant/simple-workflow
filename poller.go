@@ -88,6 +88,29 @@ func NewPoller(connString string) (*Poller, error) {
 	}, nil
 }
 
+// NewPollerWithDB creates a new workflow run poller from an existing *sql.DB and Dialect.
+// Useful for testing or when you manage the connection yourself.
+func NewPollerWithDB(db *sql.DB, dialect Dialect) *Poller {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
+
+	return &Poller{
+		db:               db,
+		dialect:          dialect,
+		runs:             NewRunRepository(db, dialect),
+		typePrefixes:     nil,
+		executors:        make(map[string]WorkflowExecutor),
+		pollInterval:     2 * time.Second,
+		leaseDuration:    30 * time.Second,
+		workerID:         workerID,
+		stopCh:           make(chan struct{}),
+		autoDetectPrefix: true,
+	}
+}
+
 // WithWorkerID sets a custom worker ID.
 // Default: hostname-pid
 func (p *Poller) WithWorkerID(id string) *Poller {

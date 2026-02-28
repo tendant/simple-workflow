@@ -2,6 +2,7 @@ package simpleworkflow
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -74,6 +75,15 @@ type WorkflowRunStatus struct {
 	Result         []byte     `json:"result,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+// WorkflowEvent represents an audit event for a workflow run.
+type WorkflowEvent struct {
+	ID         int64            `json:"id"`
+	WorkflowID string           `json:"workflow_id"`
+	EventType  string           `json:"event_type"`
+	Data       json.RawMessage  `json:"data,omitempty"`
+	CreatedAt  time.Time        `json:"created_at"`
 }
 
 // ListOptions configures filtering and pagination for listing workflow runs.
