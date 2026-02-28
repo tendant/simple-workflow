@@ -13,6 +13,13 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+// queryer is the common interface satisfied by both *sql.DB and *sql.Tx.
+type queryer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 // dbHelper holds a shared database handle and dialect, plus common helper methods.
 type dbHelper struct {
 	db      *sql.DB
@@ -146,11 +153,7 @@ func (r *RunRepository) WithTx(tx *sql.Tx) *RunRepository {
 }
 
 // queryer returns the tx if set, otherwise the db.
-func (r *RunRepository) queryer() interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-} {
+func (r *RunRepository) queryer() queryer {
 	if r.tx != nil {
 		return r.tx
 	}
@@ -513,11 +516,7 @@ func (r *ScheduleRepository) WithTx(tx *sql.Tx) *ScheduleRepository {
 }
 
 // queryer returns the tx if set, otherwise the db.
-func (r *ScheduleRepository) queryer() interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-} {
+func (r *ScheduleRepository) queryer() queryer {
 	if r.tx != nil {
 		return r.tx
 	}
