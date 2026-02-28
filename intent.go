@@ -86,7 +86,7 @@ func (c *Client) Cancel(ctx context.Context, runID string) error {
 //	    WithIdempotency("invoice:123").
 //	    WithPriority(10).
 //	    Execute(ctx)
-func (c *Client) Submit(workflowType string, payload interface{}) *SubmitBuilder {
+func (c *Client) Submit(workflowType string, payload any) *SubmitBuilder {
 	return &SubmitBuilder{
 		client: c,
 		intent: Intent{

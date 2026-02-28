@@ -24,7 +24,7 @@ func NewHandler(client *simpleworkflow.Client) *Handler {
 func (h *Handler) SubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Type           string      `json:"type"`
-		Payload        interface{} `json:"payload"`
+		Payload        any `json:"payload"`
 		Priority       int         `json:"priority,omitempty"`
 		IdempotencyKey string      `json:"idempotency_key,omitempty"`
 		MaxAttempts    int         `json:"max_attempts,omitempty"`
@@ -115,7 +115,7 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Type        string      `json:"type"`
-		Payload     interface{} `json:"payload"`
+		Payload     any `json:"payload"`
 		Cron        string      `json:"cron"`
 		Timezone    string      `json:"timezone,omitempty"`
 		Priority    int         `json:"priority,omitempty"`

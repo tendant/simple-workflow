@@ -137,11 +137,11 @@ func (p *Poller) WithTypePrefixes(prefixes ...string) *Poller {
 //
 // Example:
 //
-//	poller.HandleFunc("billing.invoice.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) {
+//	poller.HandleFunc("billing.invoice.v1", func(ctx context.Context, run *WorkflowRun) (any, error) {
 //	    // Process invoice
 //	    return result, nil
 //	})
-func (p *Poller) HandleFunc(workflowType string, fn func(context.Context, *WorkflowRun) (interface{}, error)) *Poller {
+func (p *Poller) HandleFunc(workflowType string, fn func(context.Context, *WorkflowRun) (any, error)) *Poller {
 	p.executors[workflowType] = &funcExecutorAdapter{fn: fn}
 	return p
 }
@@ -163,10 +163,10 @@ func (p *Poller) Close() error {
 
 // funcExecutorAdapter adapts a simple function to the WorkflowExecutor interface.
 type funcExecutorAdapter struct {
-	fn func(context.Context, *WorkflowRun) (interface{}, error)
+	fn func(context.Context, *WorkflowRun) (any, error)
 }
 
-func (a *funcExecutorAdapter) Execute(ctx context.Context, run *WorkflowRun) (interface{}, error) {
+func (a *funcExecutorAdapter) Execute(ctx context.Context, run *WorkflowRun) (any, error) {
 	return a.fn(ctx, run)
 }
 
@@ -317,7 +317,7 @@ func (p *Poller) executeRun(ctx context.Context, run *WorkflowRun, executionStar
 	}
 
 	// Log started event (best-effort)
-	p.runs.logEvent(ctx, run.ID, "started", map[string]interface{}{
+	p.runs.logEvent(ctx, run.ID, "started", map[string]any{
 		"worker_id": p.workerID,
 	})
 
@@ -332,7 +332,7 @@ func (p *Poller) executeRun(ctx context.Context, run *WorkflowRun, executionStar
 	}
 }
 
-func (p *Poller) markRunSucceeded(ctx context.Context, run *WorkflowRun, result interface{}, executionStart time.Time) {
+func (p *Poller) markRunSucceeded(ctx context.Context, run *WorkflowRun, result any, executionStart time.Time) {
 	if err := p.runs.MarkSucceeded(ctx, run.ID, result); err != nil {
 		log.Printf("%v", err)
 	} else {

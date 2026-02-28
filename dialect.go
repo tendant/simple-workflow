@@ -28,7 +28,7 @@ type Dialect interface {
 	// IntervalParam returns the SQL fragment and argument for adding a duration.
 	// PostgreSQL: returns ("$N::interval", "30 seconds")
 	// SQLite:     not used (TimestampAfterNow embeds the value)
-	IntervalParam(n int, seconds int) (sqlFragment string, arg interface{})
+	IntervalParam(n int, seconds int) (sqlFragment string, arg any)
 
 	// ClaimRunQuery returns the SQL for atomically claiming a workflow run.
 	// typeCondition is an already-formatted "AND (type LIKE ...)" fragment.

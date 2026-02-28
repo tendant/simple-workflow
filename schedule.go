@@ -8,7 +8,7 @@ import (
 type ScheduleBuilder struct {
 	client       *Client
 	workflowType string
-	payload      interface{}
+	payload      any
 	cronExpr     string
 	timezone     string
 	priority     int
@@ -23,7 +23,7 @@ type ScheduleBuilder struct {
 //	    Cron("0 9 * * 1").
 //	    InTimezone("America/New_York").
 //	    Create(ctx)
-func (c *Client) Schedule(workflowType string, payload interface{}) *ScheduleBuilder {
+func (c *Client) Schedule(workflowType string, payload any) *ScheduleBuilder {
 	return &ScheduleBuilder{
 		client:       c,
 		workflowType: workflowType,

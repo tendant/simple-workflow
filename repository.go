@@ -28,7 +28,7 @@ func (h *dbHelper) rewrite(query string) string {
 }
 
 // logEvent inserts an audit event (best-effort, errors are ignored).
-func (h *dbHelper) logEvent(ctx context.Context, workflowID, eventType string, data map[string]interface{}) {
+func (h *dbHelper) logEvent(ctx context.Context, workflowID, eventType string, data map[string]any) {
 	var dataJSON []byte
 	var err error
 	if data != nil {
@@ -72,7 +72,7 @@ func parseTimestamp(s string) (time.Time, error) {
 // The row must have columns: id, type, payload, status, priority, run_at,
 // idempotency_key, attempt, max_attempts, leased_by, lease_until, last_error, result,
 // created_at, updated_at.
-func scanWorkflowRun(scanner interface{ Scan(dest ...interface{}) error }) (*WorkflowRunStatus, error) {
+func scanWorkflowRun(scanner interface{ Scan(dest ...any) error }) (*WorkflowRunStatus, error) {
 	var run WorkflowRunStatus
 	var idempotencyKey, leasedBy, lastError sql.NullString
 	var leaseUntilStr sql.NullString
@@ -147,9 +147,9 @@ func (r *RunRepository) WithTx(tx *sql.Tx) *RunRepository {
 
 // queryer returns the tx if set, otherwise the db.
 func (r *RunRepository) queryer() interface {
-	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
-	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 } {
 	if r.tx != nil {
 		return r.tx
@@ -253,7 +253,7 @@ func (r *RunRepository) List(ctx context.Context, opts ListOptions) ([]WorkflowR
 	}
 
 	query := "SELECT id, type, payload, status, priority, run_at, idempotency_key, attempt, max_attempts, leased_by, lease_until, last_error, result, created_at, updated_at FROM workflow_run WHERE deleted_at IS NULL"
-	var args []interface{}
+	var args []any
 	argN := 1
 
 	if opts.Type != "" {
@@ -293,11 +293,11 @@ func (r *RunRepository) List(ctx context.Context, opts ListOptions) ([]WorkflowR
 func (r *RunRepository) Claim(ctx context.Context, workerID string, typePrefixes []string, leaseDuration time.Duration) (*WorkflowRun, error) {
 	leaseSec := int(leaseDuration.Seconds())
 
-	var args []interface{}
+	var args []any
 	var typeCondition string
 
 	if r.dialect.DriverName() == "postgres" {
-		args = []interface{}{
+		args = []any{
 			workerID,
 			fmt.Sprintf("%d seconds", leaseSec),
 		}
@@ -311,7 +311,7 @@ func (r *RunRepository) Claim(ctx context.Context, workerID string, typePrefixes
 			typeCondition = " AND (" + strings.Join(likes, " OR ") + ")"
 		}
 	} else {
-		args = []interface{}{workerID}
+		args = []any{workerID}
 		if len(typePrefixes) > 0 {
 			likes := make([]string, len(typePrefixes))
 			for i, prefix := range typePrefixes {
@@ -336,7 +336,7 @@ func (r *RunRepository) Claim(ctx context.Context, workerID string, typePrefixes
 		return nil, err
 	}
 
-	r.logEvent(ctx, run.ID, "leased", map[string]interface{}{
+	r.logEvent(ctx, run.ID, "leased", map[string]any{
 		"worker_id": workerID,
 		"attempt":   run.Attempt,
 	})
@@ -345,7 +345,7 @@ func (r *RunRepository) Claim(ctx context.Context, workerID string, typePrefixes
 }
 
 // MarkSucceeded marks a workflow run as succeeded with the given result.
-func (r *RunRepository) MarkSucceeded(ctx context.Context, runID string, result interface{}) error {
+func (r *RunRepository) MarkSucceeded(ctx context.Context, runID string, result any) error {
 	resultJSON, _ := json.Marshal(result)
 
 	query := r.rewrite(fmt.Sprintf(`
@@ -397,7 +397,7 @@ func (r *RunRepository) MarkFailed(ctx context.Context, run *WorkflowRun, execEr
 	if status == "failed" {
 		eventType = "failed"
 	}
-	r.logEvent(ctx, run.ID, eventType, map[string]interface{}{
+	r.logEvent(ctx, run.ID, eventType, map[string]any{
 		"attempt": newAttempt,
 		"error":   execErr.Error(),
 	})
@@ -420,7 +420,7 @@ func (r *RunRepository) CountPending(ctx context.Context, typePrefix string) (in
 func (r *RunRepository) ExtendLease(ctx context.Context, runID string, duration time.Duration) error {
 	sec := int(duration.Seconds())
 	var query string
-	var args []interface{}
+	var args []any
 	if r.dialect.DriverName() == "postgres" {
 		query = `
 			UPDATE workflow_run
@@ -428,7 +428,7 @@ func (r *RunRepository) ExtendLease(ctx context.Context, runID string, duration 
 				updated_at = NOW()
 			WHERE id = $2 AND status = 'leased'
 		`
-		args = []interface{}{fmt.Sprintf("%d seconds", sec), runID}
+		args = []any{fmt.Sprintf("%d seconds", sec), runID}
 	} else {
 		query = fmt.Sprintf(`
 			UPDATE workflow_run
@@ -436,7 +436,7 @@ func (r *RunRepository) ExtendLease(ctx context.Context, runID string, duration 
 				updated_at = %s
 			WHERE id = ? AND status = 'leased'
 		`, r.dialect.TimestampAfterNow(sec), r.dialect.Now())
-		args = []interface{}{runID}
+		args = []any{runID}
 	}
 	result, err := r.queryer().ExecContext(ctx, query, args...)
 	if err != nil {
@@ -446,7 +446,7 @@ func (r *RunRepository) ExtendLease(ctx context.Context, runID string, duration 
 		return err
 	}
 
-	r.logEvent(ctx, runID, "heartbeat", map[string]interface{}{
+	r.logEvent(ctx, runID, "heartbeat", map[string]any{
 		"extended_by_seconds": int(duration.Seconds()),
 	})
 	return nil
@@ -514,9 +514,9 @@ func (r *ScheduleRepository) WithTx(tx *sql.Tx) *ScheduleRepository {
 
 // queryer returns the tx if set, otherwise the db.
 func (r *ScheduleRepository) queryer() interface {
-	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
-	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 } {
 	if r.tx != nil {
 		return r.tx
@@ -525,7 +525,7 @@ func (r *ScheduleRepository) queryer() interface {
 }
 
 // Create validates and inserts a new schedule. Returns the schedule ID.
-func (r *ScheduleRepository) Create(ctx context.Context, workflowType, cronExpr, timezone string, payload interface{}, priority, maxAttempts int) (string, error) {
+func (r *ScheduleRepository) Create(ctx context.Context, workflowType, cronExpr, timezone string, payload any, priority, maxAttempts int) (string, error) {
 	if cronExpr == "" {
 		return "", fmt.Errorf("cron expression is required")
 	}

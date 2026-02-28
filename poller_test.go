@@ -41,7 +41,7 @@ func newTestPoller(t *testing.T, db *sql.DB, dialect Dialect) *Poller {
 }
 
 // insertPendingRun directly inserts a pending workflow run for testing claim logic.
-func insertPendingRun(t *testing.T, db *sql.DB, id, workflowType string, payload interface{}) {
+func insertPendingRun(t *testing.T, db *sql.DB, id, workflowType string, payload any) {
 	t.Helper()
 	payloadJSON, _ := json.Marshal(payload)
 	_, err := db.Exec(
@@ -221,7 +221,7 @@ func TestPollAndExecute(t *testing.T) {
 	poller := newTestPoller(t, db, dialect)
 
 	executed := make(chan string, 1)
-	poller.HandleFunc("test.echo.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) {
+	poller.HandleFunc("test.echo.v1", func(ctx context.Context, run *WorkflowRun) (any, error) {
 		executed <- run.ID
 		return map[string]string{"echoed": "true"}, nil
 	})
@@ -251,7 +251,7 @@ func TestPollAndExecuteError(t *testing.T) {
 	db, dialect := newTestPollerDB(t)
 	poller := newTestPoller(t, db, dialect)
 
-	poller.HandleFunc("test.fail.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) {
+	poller.HandleFunc("test.fail.v1", func(ctx context.Context, run *WorkflowRun) (any, error) {
 		return nil, fmt.Errorf("handler error")
 	})
 
@@ -273,7 +273,7 @@ func TestPollAndExecuteNoHandler(t *testing.T) {
 	db, dialect := newTestPollerDB(t)
 	poller := newTestPoller(t, db, dialect)
 	// Register a handler for a different type
-	poller.HandleFunc("other.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) {
+	poller.HandleFunc("other.v1", func(ctx context.Context, run *WorkflowRun) (any, error) {
 		return nil, nil
 	})
 
@@ -354,9 +354,9 @@ func TestDetectTypePrefixes(t *testing.T) {
 	db, dialect := newTestPollerDB(t)
 	poller := newTestPoller(t, db, dialect)
 
-	poller.HandleFunc("billing.invoice.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) { return nil, nil })
-	poller.HandleFunc("billing.receipt.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) { return nil, nil })
-	poller.HandleFunc("media.thumbnail.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) { return nil, nil })
+	poller.HandleFunc("billing.invoice.v1", func(ctx context.Context, run *WorkflowRun) (any, error) { return nil, nil })
+	poller.HandleFunc("billing.receipt.v1", func(ctx context.Context, run *WorkflowRun) (any, error) { return nil, nil })
+	poller.HandleFunc("media.thumbnail.v1", func(ctx context.Context, run *WorkflowRun) (any, error) { return nil, nil })
 
 	prefixes := poller.detectTypePrefixes()
 
@@ -382,7 +382,7 @@ func TestStartAndStop(t *testing.T) {
 	poller.pollInterval = 10 * time.Millisecond
 
 	executed := make(chan string, 10)
-	poller.HandleFunc("test.v1", func(ctx context.Context, run *WorkflowRun) (interface{}, error) {
+	poller.HandleFunc("test.v1", func(ctx context.Context, run *WorkflowRun) (any, error) {
 		executed <- run.ID
 		return nil, nil
 	})

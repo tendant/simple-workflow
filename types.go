@@ -8,7 +8,7 @@ import (
 // Intent represents a workflow intent to be executed
 type Intent struct {
 	Type           string      // e.g. "content.thumbnail.v1" (renamed from Name for semantic clarity)
-	Payload        interface{} // Will be JSON-encoded
+	Payload        any // Will be JSON-encoded
 	Priority       int         // Lower executes first (default: 100)
 	RunAfter       time.Time   // Schedule for future (default: now)
 	IdempotencyKey string      // Optional: deduplication key
@@ -40,14 +40,14 @@ type WorkflowRun struct {
 // WorkflowExecutor is implemented by users to execute specific workflows
 type WorkflowExecutor interface {
 	// Execute runs the workflow and returns the result or error
-	Execute(ctx context.Context, run *WorkflowRun) (interface{}, error)
+	Execute(ctx context.Context, run *WorkflowRun) (any, error)
 }
 
 // Schedule represents a recurring workflow schedule.
 type Schedule struct {
 	ID          string
 	Type        string
-	Payload     interface{}
+	Payload     any
 	CronExpr    string
 	Timezone    string
 	NextRunAt   time.Time

@@ -22,7 +22,7 @@ func (d *PostgresDialect) TimestampAfterNow(seconds int) string {
 	return fmt.Sprintf("NOW() + interval '%d seconds'", seconds)
 }
 
-func (d *PostgresDialect) IntervalParam(n int, seconds int) (string, interface{}) {
+func (d *PostgresDialect) IntervalParam(n int, seconds int) (string, any) {
 	return fmt.Sprintf("$%d::interval", n), fmt.Sprintf("%d seconds", seconds)
 }
 

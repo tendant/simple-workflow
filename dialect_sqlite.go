@@ -18,7 +18,7 @@ func (d *SQLiteDialect) TimestampAfterNow(seconds int) string {
 	return fmt.Sprintf("datetime('now', '+%d seconds')", seconds)
 }
 
-func (d *SQLiteDialect) IntervalParam(n int, seconds int) (string, interface{}) {
+func (d *SQLiteDialect) IntervalParam(n int, seconds int) (string, any) {
 	// SQLite doesn't use interval params; value is embedded in SQL via TimestampAfterNow.
 	return fmt.Sprintf("datetime('now', '+%d seconds')", seconds), nil
 }
