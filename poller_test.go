@@ -31,6 +31,7 @@ func newTestPoller(t *testing.T, db *sql.DB, dialect Dialect) *Poller {
 	return &Poller{
 		db:            db,
 		dialect:       dialect,
+		runs:          NewRunRepository(db, dialect),
 		executors:     make(map[string]WorkflowExecutor),
 		pollInterval:  50 * time.Millisecond,
 		leaseDuration: 30 * time.Second,

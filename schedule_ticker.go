@@ -3,12 +3,10 @@ package simpleworkflow
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 )
 
@@ -17,6 +15,8 @@ import (
 type ScheduleTicker struct {
 	db           *sql.DB
 	dialect      Dialect
+	runs         *RunRepository
+	sched        *ScheduleRepository
 	tickInterval time.Duration
 	stopCh       chan struct{}
 }
@@ -41,6 +41,8 @@ func NewScheduleTicker(connString string) (*ScheduleTicker, error) {
 	return &ScheduleTicker{
 		db:           db,
 		dialect:      dialect,
+		runs:         NewRunRepository(db, dialect),
+		sched:        NewScheduleRepository(db, dialect),
 		tickInterval: 15 * time.Second,
 		stopCh:       make(chan struct{}),
 	}, nil
@@ -51,6 +53,8 @@ func newScheduleTickerFromDB(db *sql.DB, dialect Dialect) *ScheduleTicker {
 	return &ScheduleTicker{
 		db:           db,
 		dialect:      dialect,
+		runs:         NewRunRepository(db, dialect),
+		sched:        NewScheduleRepository(db, dialect),
 		tickInterval: 15 * time.Second,
 		stopCh:       make(chan struct{}),
 	}
@@ -97,13 +101,6 @@ func (t *ScheduleTicker) Close() error {
 	return nil
 }
 
-func (t *ScheduleTicker) rewrite(query string) string {
-	if t.dialect.DriverName() == "postgres" {
-		return query
-	}
-	return RewritePlaceholders(query)
-}
-
 // Tick performs a single tick: finds due schedules and creates workflow_run rows.
 // Exported for testing.
 func (t *ScheduleTicker) Tick(ctx context.Context) error {
@@ -113,78 +110,43 @@ func (t *ScheduleTicker) Tick(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 
-	// Claim due schedules (with SKIP LOCKED on Postgres, plain SELECT on SQLite)
-	rows, err := tx.QueryContext(ctx, t.dialect.ClaimSchedulesQuery())
+	// Create transactional views of repositories
+	schedTx := t.sched.WithTx(tx)
+	runsTx := t.runs.WithTx(tx)
+
+	// Claim due schedules
+	due, err := schedTx.ClaimDue(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to query due schedules: %w", err)
-	}
-	defer rows.Close()
-
-	type dueSchedule struct {
-		id          string
-		typ         string
-		payload     []byte
-		cronExpr    string
-		timezone    string
-		nextRunAt   time.Time
-		priority    int
-		maxAttempts int
-	}
-
-	var due []dueSchedule
-	for rows.Next() {
-		var s dueSchedule
-		if err := rows.Scan(&s.id, &s.typ, &s.payload, &s.cronExpr, &s.timezone, &s.nextRunAt, &s.priority, &s.maxAttempts); err != nil {
-			return fmt.Errorf("failed to scan schedule: %w", err)
-		}
-		due = append(due, s)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error iterating schedules: %w", err)
+		return err
 	}
 
 	cronParser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	now := t.dialect.Now()
 
 	for _, s := range due {
 		// Generate idempotency key from schedule ID and fire time
-		fireTimeUnix := s.nextRunAt.Unix()
-		idempotencyKey := fmt.Sprintf("schedule:%s:%d", s.id, fireTimeUnix)
-
-		runID := uuid.New().String()
+		fireTimeUnix := s.NextRunAt.Unix()
+		idempotencyKey := fmt.Sprintf("schedule:%s:%d", s.ID, fireTimeUnix)
 
 		// Insert workflow_run with idempotency key
-		insertQuery := t.rewrite(fmt.Sprintf(`
-			INSERT INTO workflow_run (
-				id, type, payload, priority, run_at, idempotency_key, max_attempts
-			) VALUES ($1, $2, $3, $4, %s, $5, $6)
-			ON CONFLICT (idempotency_key) DO NOTHING
-			RETURNING id
-		`, now))
-
-		var returnedID sql.NullString
-		err := tx.QueryRowContext(ctx, insertQuery,
-			runID, s.typ, json.RawMessage(s.payload), s.priority, idempotencyKey, s.maxAttempts,
-		).Scan(&returnedID)
-
-		if err != nil && err != sql.ErrNoRows {
-			return fmt.Errorf("failed to insert workflow_run for schedule %s: %w", s.id, err)
+		returnedID, err := runsTx.CreateFromSchedule(ctx, s.Type, s.Payload, s.Priority, s.MaxAttempts, idempotencyKey)
+		if err != nil {
+			return fmt.Errorf("failed to insert workflow_run for schedule %s: %w", s.ID, err)
 		}
 
-		if returnedID.Valid {
-			log.Printf("Schedule %s fired: created workflow_run %s (key: %s)", s.id, returnedID.String, idempotencyKey)
+		if returnedID != "" {
+			log.Printf("Schedule %s fired: created workflow_run %s (key: %s)", s.ID, returnedID, idempotencyKey)
 		}
 
 		// Compute next fire time
-		loc, err := time.LoadLocation(s.timezone)
+		loc, err := time.LoadLocation(s.Timezone)
 		if err != nil {
-			log.Printf("Invalid timezone %q for schedule %s, using UTC", s.timezone, s.id)
+			log.Printf("Invalid timezone %q for schedule %s, using UTC", s.Timezone, s.ID)
 			loc = time.UTC
 		}
 
-		sched, err := cronParser.Parse(s.cronExpr)
+		sched, err := cronParser.Parse(s.CronExpr)
 		if err != nil {
-			log.Printf("Invalid cron expression %q for schedule %s: %v", s.cronExpr, s.id, err)
+			log.Printf("Invalid cron expression %q for schedule %s: %v", s.CronExpr, s.ID, err)
 			continue
 		}
 
@@ -192,14 +154,8 @@ func (t *ScheduleTicker) Tick(ctx context.Context) error {
 		nextRun := sched.Next(goNow)
 
 		// Update schedule with next run time
-		updateQuery := t.rewrite(fmt.Sprintf(`
-			UPDATE workflow_schedule
-			SET next_run_at = $1, last_run_at = %s, updated_at = %s
-			WHERE id = $2
-		`, now, now))
-		_, err = tx.ExecContext(ctx, updateQuery, nextRun, s.id)
-		if err != nil {
-			return fmt.Errorf("failed to update schedule %s: %w", s.id, err)
+		if err := schedTx.AdvanceNextRun(ctx, s.ID, nextRun); err != nil {
+			return err
 		}
 	}
 
