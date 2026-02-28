@@ -6,6 +6,52 @@ import (
 	"strings"
 )
 
+// DetectDialect examines a connection string and returns the appropriate Dialect,
+// the (possibly modified) DSN to pass to the driver, and any error.
+//
+// Supported schemes:
+//   - postgres:// or postgresql:// → PostgresDialect (DSN includes search_path)
+//   - sqlite:// or sqlite3:// → SQLiteDialect (DSN is the file path with query params)
+//   - key=value format (no scheme) → PostgresDialect (legacy PostgreSQL format)
+func DetectDialect(connString string) (Dialect, string, error) {
+	lower := strings.ToLower(connString)
+
+	switch {
+	case strings.HasPrefix(lower, "sqlite://") || strings.HasPrefix(lower, "sqlite3://"):
+		// sqlite:///path/to/db.sqlite → /path/to/db.sqlite
+		// sqlite://path/to/db.sqlite → path/to/db.sqlite
+		// sqlite://:memory: → :memory:
+		u, err := url.Parse(connString)
+		if err != nil {
+			return nil, "", fmt.Errorf("invalid sqlite connection string: %w", err)
+		}
+		dsn := u.Host + u.Path
+		if dsn == "" {
+			dsn = ":memory:"
+		}
+		// Preserve query parameters (e.g. ?_busy_timeout=5000)
+		if u.RawQuery != "" {
+			dsn += "?" + u.RawQuery
+		}
+		return &SQLiteDialect{}, dsn, nil
+
+	case strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://"):
+		modifiedConn, _, err := ParseConnString(connString, DefaultSchema)
+		if err != nil {
+			return nil, "", err
+		}
+		return &PostgresDialect{}, modifiedConn, nil
+
+	default:
+		// Key=value format → assume PostgreSQL
+		modifiedConn, _, err := ParseConnString(connString, DefaultSchema)
+		if err != nil {
+			return nil, "", err
+		}
+		return &PostgresDialect{}, modifiedConn, nil
+	}
+}
+
 // ParseConnString extracts schema information from a connection string
 // and returns a modified connection string with search_path parameter.
 //

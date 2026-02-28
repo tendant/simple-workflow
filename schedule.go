@@ -97,13 +97,13 @@ func (s *ScheduleBuilder) Create(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
-	query := `
+	query := s.client.rewrite(`
 		INSERT INTO workflow_schedule (
 			type, payload, schedule, timezone, next_run_at,
 			priority, max_attempts
 		) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING id
-	`
+	`)
 
 	var id string
 	err = s.client.db.QueryRowContext(ctx, query,
@@ -119,11 +119,11 @@ func (s *ScheduleBuilder) Create(ctx context.Context) (string, error) {
 
 // PauseSchedule disables a schedule so it won't fire.
 func (c *Client) PauseSchedule(ctx context.Context, scheduleID string) error {
-	query := `
+	query := c.rewrite(fmt.Sprintf(`
 		UPDATE workflow_schedule
-		SET enabled = false, updated_at = NOW()
+		SET enabled = false, updated_at = %s
 		WHERE id = $1 AND deleted_at IS NULL
-	`
+	`, c.dialect.Now()))
 	result, err := c.db.ExecContext(ctx, query, scheduleID)
 	if err != nil {
 		return fmt.Errorf("failed to pause schedule: %w", err)
@@ -140,11 +140,11 @@ func (c *Client) PauseSchedule(ctx context.Context, scheduleID string) error {
 
 // ResumeSchedule re-enables a paused schedule.
 func (c *Client) ResumeSchedule(ctx context.Context, scheduleID string) error {
-	query := `
+	query := c.rewrite(fmt.Sprintf(`
 		UPDATE workflow_schedule
-		SET enabled = true, updated_at = NOW()
+		SET enabled = true, updated_at = %s
 		WHERE id = $1 AND deleted_at IS NULL
-	`
+	`, c.dialect.Now()))
 	result, err := c.db.ExecContext(ctx, query, scheduleID)
 	if err != nil {
 		return fmt.Errorf("failed to resume schedule: %w", err)
@@ -161,11 +161,12 @@ func (c *Client) ResumeSchedule(ctx context.Context, scheduleID string) error {
 
 // DeleteSchedule soft-deletes a schedule.
 func (c *Client) DeleteSchedule(ctx context.Context, scheduleID string) error {
-	query := `
+	now := c.dialect.Now()
+	query := c.rewrite(fmt.Sprintf(`
 		UPDATE workflow_schedule
-		SET deleted_at = NOW(), enabled = false, updated_at = NOW()
+		SET deleted_at = %s, enabled = false, updated_at = %s
 		WHERE id = $1 AND deleted_at IS NULL
-	`
+	`, now, now))
 	result, err := c.db.ExecContext(ctx, query, scheduleID)
 	if err != nil {
 		return fmt.Errorf("failed to delete schedule: %w", err)

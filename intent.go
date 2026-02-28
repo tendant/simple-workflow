@@ -12,38 +12,42 @@ import (
 
 // Client manages workflow runs in the database (Producer API)
 type Client struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 }
 
-// NewClient creates a new client from a PostgreSQL connection string.
-// The connection string can include ?schema=name or ?search_path=name parameter.
+// NewClient creates a new client from a connection string.
+// The connection string determines the dialect (PostgreSQL or SQLite).
 //
 // Examples:
 //   - NewClient("postgres://user:pass@localhost/db?schema=workflow")
-//   - NewClient("postgres://user:pass@localhost/db?search_path=workflow")
-//   - NewClient("postgres://user:pass@localhost/db") // uses default "workflow" schema
+//   - NewClient("sqlite:///path/to/db.sqlite")
+//   - NewClient("sqlite://:memory:")
 //
 // The client will manage the database connection and Close() must be called.
 func NewClient(connString string) (*Client, error) {
-	// Parse connection string and inject search_path if needed
-	modifiedConn, _, err := ParseConnString(connString, DefaultSchema)
+	dialect, dsn, err := DetectDialect(connString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse connection string: %w", err)
 	}
 
-	// Open database connection
-	db, err := sql.Open("postgres", modifiedConn)
+	db, err := dialect.OpenDB(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Test connection
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	return &Client{db: db}, nil
+	return &Client{db: db, dialect: dialect}, nil
+}
+
+// NewClientWithDB creates a new client from an existing *sql.DB and Dialect.
+// Useful for testing or when you manage the connection yourself.
+func NewClientWithDB(db *sql.DB, dialect Dialect) *Client {
+	return &Client{db: db, dialect: dialect}
 }
 
 // Close closes the database connection.
@@ -75,14 +79,14 @@ func (c *Client) create(ctx context.Context, intent Intent) (string, error) {
 		maxAttempts = 3
 	}
 
-	query := `
+	query := c.rewrite(`
 		INSERT INTO workflow_run (
 			id, type, payload, priority, run_at,
 			idempotency_key, max_attempts
 		) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING id
-	`
+	`)
 
 	var returnedID string
 	err = c.db.QueryRowContext(ctx, query,
@@ -105,13 +109,21 @@ func (c *Client) create(ctx context.Context, intent Intent) (string, error) {
 	return returnedID, nil
 }
 
+// rewrite converts $N placeholders to ? for SQLite, or returns as-is for PostgreSQL.
+func (c *Client) rewrite(query string) string {
+	if c.dialect.DriverName() == "postgres" {
+		return query
+	}
+	return RewritePlaceholders(query)
+}
+
 // Cancel marks a workflow run as cancelled (cooperative cancellation)
 func (c *Client) Cancel(ctx context.Context, runID string) error {
-	query := `
+	query := c.rewrite(fmt.Sprintf(`
 		UPDATE workflow_run
-		SET status = 'cancelled', updated_at = NOW()
+		SET status = 'cancelled', updated_at = %s
 		WHERE id = $1 AND status IN ('pending', 'leased')
-	`
+	`, c.dialect.Now()))
 
 	result, err := c.db.ExecContext(ctx, query, runID)
 	if err != nil {
@@ -144,10 +156,10 @@ func (c *Client) logEvent(ctx context.Context, workflowID, eventType string, dat
 		}
 	}
 
-	query := `
+	query := c.rewrite(`
 		INSERT INTO workflow_event (workflow_id, event_type, data)
 		VALUES ($1, $2, $3)
-	`
+	`)
 
 	// Use a short timeout for event logging to avoid blocking
 	eventCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
@@ -219,4 +231,132 @@ func (s *SubmitBuilder) RunIn(d time.Duration) *SubmitBuilder {
 // Returns empty string if idempotency key conflict (run already exists).
 func (s *SubmitBuilder) Execute(ctx context.Context) (string, error) {
 	return s.client.create(ctx, s.intent)
+}
+
+// GetWorkflowRun retrieves a single workflow run by ID.
+func (c *Client) GetWorkflowRun(ctx context.Context, id string) (*WorkflowRunStatus, error) {
+	query := c.rewrite(`
+		SELECT id, type, payload, status, priority, run_at,
+			   idempotency_key, attempt, max_attempts,
+			   leased_by, lease_until, last_error, result,
+			   created_at, updated_at
+		FROM workflow_run
+		WHERE id = $1 AND deleted_at IS NULL
+	`)
+
+	var run WorkflowRunStatus
+	var idempotencyKey, leasedBy, lastError sql.NullString
+	var leaseUntil sql.NullTime
+	var result []byte
+
+	err := c.db.QueryRowContext(ctx, query, id).Scan(
+		&run.ID, &run.Type, &run.Payload, &run.Status, &run.Priority, &run.RunAt,
+		&idempotencyKey, &run.Attempt, &run.MaxAttempts,
+		&leasedBy, &leaseUntil, &lastError, &result,
+		&run.CreatedAt, &run.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get workflow run: %w", err)
+	}
+
+	if idempotencyKey.Valid {
+		run.IdempotencyKey = &idempotencyKey.String
+	}
+	if leasedBy.Valid {
+		run.LeasedBy = &leasedBy.String
+	}
+	if leaseUntil.Valid {
+		run.LeaseUntil = &leaseUntil.Time
+	}
+	if lastError.Valid {
+		run.LastError = &lastError.String
+	}
+	if result != nil {
+		run.Result = result
+	}
+
+	return &run, nil
+}
+
+// ListWorkflowRuns returns workflow runs matching the given options.
+func (c *Client) ListWorkflowRuns(ctx context.Context, opts ListOptions) ([]WorkflowRunStatus, error) {
+	if opts.Limit <= 0 {
+		opts.Limit = 50
+	}
+
+	query := "SELECT id, type, payload, status, priority, run_at, idempotency_key, attempt, max_attempts, leased_by, lease_until, last_error, result, created_at, updated_at FROM workflow_run WHERE deleted_at IS NULL"
+	var args []interface{}
+	argN := 1
+
+	if opts.Type != "" {
+		query += fmt.Sprintf(" AND type = %s", c.dialect.Placeholder(argN))
+		args = append(args, opts.Type)
+		argN++
+	}
+	if opts.Status != "" {
+		query += fmt.Sprintf(" AND status = %s", c.dialect.Placeholder(argN))
+		args = append(args, opts.Status)
+		argN++
+	}
+
+	query += " ORDER BY created_at DESC"
+	query += fmt.Sprintf(" LIMIT %s OFFSET %s", c.dialect.Placeholder(argN), c.dialect.Placeholder(argN+1))
+	args = append(args, opts.Limit, opts.Offset)
+
+	rows, err := c.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list workflow runs: %w", err)
+	}
+	defer rows.Close()
+
+	var runs []WorkflowRunStatus
+	for rows.Next() {
+		var run WorkflowRunStatus
+		var idempotencyKey, leasedBy, lastError sql.NullString
+		var leaseUntil sql.NullTime
+		var result []byte
+
+		if err := rows.Scan(
+			&run.ID, &run.Type, &run.Payload, &run.Status, &run.Priority, &run.RunAt,
+			&idempotencyKey, &run.Attempt, &run.MaxAttempts,
+			&leasedBy, &leaseUntil, &lastError, &result,
+			&run.CreatedAt, &run.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan workflow run: %w", err)
+		}
+
+		if idempotencyKey.Valid {
+			run.IdempotencyKey = &idempotencyKey.String
+		}
+		if leasedBy.Valid {
+			run.LeasedBy = &leasedBy.String
+		}
+		if leaseUntil.Valid {
+			run.LeaseUntil = &leaseUntil.Time
+		}
+		if lastError.Valid {
+			run.LastError = &lastError.String
+		}
+		if result != nil {
+			run.Result = result
+		}
+
+		runs = append(runs, run)
+	}
+
+	return runs, rows.Err()
+}
+
+// DB returns the underlying database connection.
+// Useful for the REST API layer that needs to pass the db to handler functions.
+func (c *Client) DB() *sql.DB {
+	return c.db
+}
+
+// Dialect returns the dialect used by this client.
+func (c *Client) Dialect() Dialect {
+	return c.dialect
 }

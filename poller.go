@@ -22,6 +22,7 @@ type PollerConfig struct {
 // Poller polls workflow_run table and executes workflows (Worker API)
 type Poller struct {
 	db               *sql.DB
+	dialect          Dialect
 	typePrefixes     []string // e.g. ["billing.%", "media.%"]
 	executors        map[string]WorkflowExecutor
 	pollInterval     time.Duration
@@ -46,19 +47,16 @@ type Poller struct {
 //   poller.HandleFunc("billing.invoice.v1", handler)
 //   poller.Start(ctx)
 func NewPoller(connString string) (*Poller, error) {
-	// Parse connection string and inject search_path if needed
-	modifiedConn, _, err := ParseConnString(connString, DefaultSchema)
+	dialect, dsn, err := DetectDialect(connString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse connection string: %w", err)
 	}
 
-	// Open database connection
-	db, err := sql.Open("postgres", modifiedConn)
+	db, err := dialect.OpenDB(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Test connection
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
@@ -73,6 +71,7 @@ func NewPoller(connString string) (*Poller, error) {
 
 	return &Poller{
 		db:               db,
+		dialect:          dialect,
 		typePrefixes:     nil, // Will be auto-detected
 		executors:        make(map[string]WorkflowExecutor),
 		pollInterval:     2 * time.Second,  // default
@@ -116,7 +115,7 @@ func (p *Poller) WithScheduleTicker() *Poller {
 func (p *Poller) WithScheduleTickInterval(d time.Duration) *Poller {
 	p.scheduleTickerEnabled = true
 	if p.scheduleTicker == nil {
-		p.scheduleTicker = newScheduleTickerFromDB(p.db)
+		p.scheduleTicker = newScheduleTickerFromDB(p.db, p.dialect)
 	}
 	p.scheduleTicker.tickInterval = d
 	return p
@@ -189,7 +188,7 @@ func (p *Poller) Start(ctx context.Context) {
 	// Start schedule ticker goroutine if enabled
 	if p.scheduleTickerEnabled {
 		if p.scheduleTicker == nil {
-			p.scheduleTicker = newScheduleTickerFromDB(p.db)
+			p.scheduleTicker = newScheduleTickerFromDB(p.db, p.dialect)
 		}
 		go p.scheduleTicker.Start(ctx)
 		log.Printf("Embedded schedule ticker started (interval: %s)", p.scheduleTicker.tickInterval)
@@ -293,43 +292,41 @@ func (p *Poller) pollAndExecute(ctx context.Context) {
 }
 
 func (p *Poller) claimRun(ctx context.Context) (*WorkflowRun, error) {
+	leaseSec := int(p.leaseDuration.Seconds())
+
 	// Build parameterized type-prefix LIKE conditions
-	// Parameters: $1 = workerID, $2 = leaseDuration, $3.. = type prefixes
-	args := []interface{}{
-		p.workerID,
-		fmt.Sprintf("%d seconds", int(p.leaseDuration.Seconds())),
-	}
+	// For Postgres: $1=workerID, $2=leaseDuration, $3..=type prefixes
+	// For SQLite:   ?=workerID, then type prefixes only (lease is embedded in SQL)
+	var args []interface{}
+	var typeCondition string
 
-	typeCondition := ""
-	if len(p.typePrefixes) > 0 {
-		likes := make([]string, len(p.typePrefixes))
-		for i, prefix := range p.typePrefixes {
-			paramIdx := i + 3 // $3, $4, ...
-			likes[i] = fmt.Sprintf("type LIKE $%d", paramIdx)
-			args = append(args, prefix)
+	if p.dialect.DriverName() == "postgres" {
+		args = []interface{}{
+			p.workerID,
+			fmt.Sprintf("%d seconds", leaseSec),
 		}
-		typeCondition = " AND (" + strings.Join(likes, " OR ") + ")"
+		if len(p.typePrefixes) > 0 {
+			likes := make([]string, len(p.typePrefixes))
+			for i, prefix := range p.typePrefixes {
+				paramIdx := i + 3
+				likes[i] = fmt.Sprintf("type LIKE $%d", paramIdx)
+				args = append(args, prefix)
+			}
+			typeCondition = " AND (" + strings.Join(likes, " OR ") + ")"
+		}
+	} else {
+		args = []interface{}{p.workerID}
+		if len(p.typePrefixes) > 0 {
+			likes := make([]string, len(p.typePrefixes))
+			for i, prefix := range p.typePrefixes {
+				likes[i] = "type LIKE ?"
+				args = append(args, prefix)
+			}
+			typeCondition = " AND (" + strings.Join(likes, " OR ") + ")"
+		}
 	}
 
-	// Atomic claim: UPDATE...RETURNING with SKIP LOCKED subquery
-	query := fmt.Sprintf(`
-		UPDATE workflow_run
-		SET status = 'leased',
-			leased_by = $1,
-			lease_until = NOW() + $2::interval,
-			updated_at = NOW()
-		WHERE id = (
-			SELECT id FROM workflow_run
-			WHERE status = 'pending'
-			  AND run_at <= NOW()
-			  AND deleted_at IS NULL
-			  %s
-			ORDER BY priority ASC, created_at ASC
-			FOR UPDATE SKIP LOCKED
-			LIMIT 1
-		)
-		RETURNING id, type, payload, attempt, max_attempts
-	`, typeCondition)
+	query := p.dialect.ClaimRunQuery(typeCondition, leaseSec)
 
 	var run WorkflowRun
 	err := p.db.QueryRowContext(ctx, query, args...).Scan(
@@ -381,16 +378,23 @@ func (p *Poller) executeRun(ctx context.Context, run *WorkflowRun, executionStar
 	}
 }
 
+func (p *Poller) rewrite(query string) string {
+	if p.dialect.DriverName() == "postgres" {
+		return query
+	}
+	return RewritePlaceholders(query)
+}
+
 func (p *Poller) markRunSucceeded(ctx context.Context, run *WorkflowRun, result interface{}, executionStart time.Time) {
 	resultJSON, _ := json.Marshal(result)
 
-	query := `
+	query := p.rewrite(fmt.Sprintf(`
 		UPDATE workflow_run
 		SET status = 'succeeded',
 			result = $1,
-			updated_at = NOW()
+			updated_at = %s
 		WHERE id = $2
-	`
+	`, p.dialect.Now()))
 	_, err := p.db.ExecContext(ctx, query, resultJSON, run.ID)
 	if err != nil {
 		log.Printf("Failed to mark workflow run %s as succeeded: %v", run.ID, err)
@@ -421,15 +425,15 @@ func (p *Poller) markRunFailed(ctx context.Context, run *WorkflowRun, execErr er
 		status = "failed" // Terminal state (was "deadletter")
 	}
 
-	query := `
+	query := p.rewrite(fmt.Sprintf(`
 		UPDATE workflow_run
 		SET status = $1,
 			attempt = $2,
 			run_at = $3,
 			last_error = $4,
-			updated_at = NOW()
+			updated_at = %s
 		WHERE id = $5
-	`
+	`, p.dialect.Now()))
 	_, err := p.db.ExecContext(ctx, query, status, newAttempt, runAt, execErr.Error(), run.ID)
 	if err != nil {
 		log.Printf("Failed to mark workflow run %s as failed: %v", run.ID, err)
@@ -473,8 +477,8 @@ func (p *Poller) updateQueueDepth(ctx context.Context) {
 	for _, prefix := range p.typePrefixes {
 		var depth int
 		err := p.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM workflow_run
-			 WHERE type LIKE $1 AND status = 'pending' AND deleted_at IS NULL`,
+			p.rewrite(`SELECT COUNT(*) FROM workflow_run
+			 WHERE type LIKE $1 AND status = 'pending' AND deleted_at IS NULL`),
 			prefix,
 		).Scan(&depth)
 
@@ -487,14 +491,27 @@ func (p *Poller) updateQueueDepth(ctx context.Context) {
 // makeHeartbeatFunc creates a heartbeat function for extending workflow run lease
 func (p *Poller) makeHeartbeatFunc(runID string) HeartbeatFunc {
 	return func(ctx context.Context, duration time.Duration) error {
-		query := `
-			UPDATE workflow_run
-			SET lease_until = NOW() + $1::interval,
-				updated_at = NOW()
-			WHERE id = $2 AND status = 'leased'
-		`
-		durationStr := fmt.Sprintf("%d seconds", int(duration.Seconds()))
-		result, err := p.db.ExecContext(ctx, query, durationStr, runID)
+		sec := int(duration.Seconds())
+		var query string
+		var args []interface{}
+		if p.dialect.DriverName() == "postgres" {
+			query = `
+				UPDATE workflow_run
+				SET lease_until = NOW() + $1::interval,
+					updated_at = NOW()
+				WHERE id = $2 AND status = 'leased'
+			`
+			args = []interface{}{fmt.Sprintf("%d seconds", sec), runID}
+		} else {
+			query = fmt.Sprintf(`
+				UPDATE workflow_run
+				SET lease_until = %s,
+					updated_at = %s
+				WHERE id = ? AND status = 'leased'
+			`, p.dialect.TimestampAfterNow(sec), p.dialect.Now())
+			args = []interface{}{runID}
+		}
+		result, err := p.db.ExecContext(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("failed to extend lease: %w", err)
 		}
@@ -521,7 +538,7 @@ func (p *Poller) makeHeartbeatFunc(runID string) HeartbeatFunc {
 func (p *Poller) makeCancellationCheckFunc(runID string) CancellationCheckFunc {
 	return func(ctx context.Context) (bool, error) {
 		var status string
-		query := `SELECT status FROM workflow_run WHERE id = $1`
+		query := p.rewrite(`SELECT status FROM workflow_run WHERE id = $1`)
 		err := p.db.QueryRowContext(ctx, query, runID).Scan(&status)
 		if err != nil {
 			return false, fmt.Errorf("failed to check cancellation status: %w", err)
@@ -541,10 +558,10 @@ func (p *Poller) logEvent(ctx context.Context, workflowID, eventType string, dat
 		}
 	}
 
-	query := `
+	query := p.rewrite(`
 		INSERT INTO workflow_event (workflow_id, event_type, data)
 		VALUES ($1, $2, $3)
-	`
+	`)
 
 	// Use a short timeout for event logging to avoid blocking
 	eventCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)

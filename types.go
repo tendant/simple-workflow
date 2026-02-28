@@ -56,3 +56,30 @@ type Schedule struct {
 	Priority    int
 	MaxAttempts int
 }
+
+// WorkflowRunStatus is the full read model for a workflow run, with JSON tags for API responses.
+type WorkflowRunStatus struct {
+	ID             string     `json:"id"`
+	Type           string     `json:"type"`
+	Payload        []byte     `json:"payload"`
+	Status         string     `json:"status"`
+	Priority       int        `json:"priority"`
+	RunAt          time.Time  `json:"run_at"`
+	IdempotencyKey *string    `json:"idempotency_key,omitempty"`
+	Attempt        int        `json:"attempt"`
+	MaxAttempts    int        `json:"max_attempts"`
+	LeasedBy       *string    `json:"leased_by,omitempty"`
+	LeaseUntil     *time.Time `json:"lease_until,omitempty"`
+	LastError      *string    `json:"last_error,omitempty"`
+	Result         []byte     `json:"result,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+// ListOptions configures filtering and pagination for listing workflow runs.
+type ListOptions struct {
+	Type   string // Filter by workflow type (exact match)
+	Status string // Filter by status
+	Limit  int    // Max results (default: 50)
+	Offset int    // Pagination offset
+}
