@@ -1,4 +1,4 @@
-.PHONY: help migrate-up migrate-down migrate-status migrate-reset test build clean
+.PHONY: help migrate-up migrate-down migrate-status migrate-reset test build clean install-skill uninstall-skill
 
 # Load .env file if it exists
 ifneq (,$(wildcard .env))
@@ -35,6 +35,10 @@ help:
 	@echo "Build:"
 	@echo "  make build           - Build the library"
 	@echo "  make clean           - Clean build artifacts"
+	@echo ""
+	@echo "Agent Skills:"
+	@echo "  make install-skill   - Install agent skill for Claude Code and Codex"
+	@echo "  make uninstall-skill - Remove agent skill from both locations"
 	@echo ""
 	@echo "Environment Variables:"
 	@echo "  DB_HOST              - Database host (default: localhost)"
@@ -91,6 +95,22 @@ clean:
 	@echo "Cleaning build artifacts..."
 	@go clean
 	@echo "✓ Clean complete"
+
+# Agent skill management
+SKILL_NAME = simple-workflow
+SKILL_SRC = skills/$(SKILL_NAME)/SKILL.md
+CLAUDE_SKILL_DIR = $(HOME)/.claude/skills/$(SKILL_NAME)
+CODEX_SKILL_DIR = $(HOME)/.agents/skills/$(SKILL_NAME)
+
+install-skill:
+	@mkdir -p $(CLAUDE_SKILL_DIR) $(CODEX_SKILL_DIR)
+	@cp $(SKILL_SRC) $(CLAUDE_SKILL_DIR)/SKILL.md
+	@cp $(SKILL_SRC) $(CODEX_SKILL_DIR)/SKILL.md
+	@echo "✓ Skill installed to $(CLAUDE_SKILL_DIR) and $(CODEX_SKILL_DIR)"
+
+uninstall-skill:
+	@rm -rf $(CLAUDE_SKILL_DIR) $(CODEX_SKILL_DIR)
+	@echo "✓ Skill uninstalled"
 
 # Create a new migration file
 migrate-create:
