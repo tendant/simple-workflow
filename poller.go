@@ -34,6 +34,7 @@ type Poller struct {
 	metrics          MetricsCollector // Optional: metrics collector for observability
 	startTime        time.Time        // Worker start time for uptime calculation
 	autoDetectPrefix bool             // true if type prefixes should be auto-detected from handlers
+	autoMigrate      bool             // true if AutoMigrate should run on Start()
 
 	wg sync.WaitGroup // tracks in-flight executions for graceful shutdown
 
@@ -132,6 +133,12 @@ func (p *Poller) WithPollInterval(d time.Duration) *Poller {
 	return p
 }
 
+// WithAutoMigrate enables automatic schema migration when Start() is called.
+func (p *Poller) WithAutoMigrate() *Poller {
+	p.autoMigrate = true
+	return p
+}
+
 // WithScheduleTicker enables the schedule ticker inside the poller.
 // The ticker converts due workflow_schedule rows into workflow_run rows.
 func (p *Poller) WithScheduleTicker() *Poller {
@@ -205,6 +212,14 @@ func (p *Poller) SetMetrics(m MetricsCollector) {
 
 // Start begins polling for workflow runs
 func (p *Poller) Start(ctx context.Context) {
+	// Run auto-migration if enabled
+	if p.autoMigrate {
+		if err := p.AutoMigrate(ctx); err != nil {
+			slog.Error("auto-migrate failed", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	// Auto-detect type prefixes from registered handlers if needed
 	if p.autoDetectPrefix && len(p.typePrefixes) == 0 {
 		p.typePrefixes = p.detectTypePrefixes()
