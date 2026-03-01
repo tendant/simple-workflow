@@ -281,6 +281,11 @@ func (r *RunRepository) List(ctx context.Context, opts ListOptions) ([]WorkflowR
 		args = append(args, opts.Status)
 		argN++
 	}
+	if opts.IdempotencyKey != "" {
+		query += fmt.Sprintf(" AND idempotency_key = %s", r.dialect.Placeholder(argN))
+		args = append(args, opts.IdempotencyKey)
+		argN++
+	}
 
 	query += " ORDER BY created_at DESC"
 	query += fmt.Sprintf(" LIMIT %s OFFSET %s", r.dialect.Placeholder(argN), r.dialect.Placeholder(argN+1))

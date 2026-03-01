@@ -88,8 +88,9 @@ type WorkflowEvent struct {
 
 // ListOptions configures filtering and pagination for listing workflow runs.
 type ListOptions struct {
-	Type   string // Filter by workflow type (exact match)
-	Status string // Filter by status
-	Limit  int    // Max results (default: 50)
-	Offset int    // Pagination offset
+	Type           string // Filter by workflow type (exact match)
+	Status         string // Filter by status
+	IdempotencyKey string // Filter by idempotency key (exact match)
+	Limit          int    // Max results (default: 50)
+	Offset         int    // Pagination offset
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	simpleworkflow "github.com/tendant/simple-workflow"
@@ -23,11 +24,12 @@ func NewHandler(client *simpleworkflow.Client) *Handler {
 // SubmitWorkflow handles POST /api/v1/workflows
 func (h *Handler) SubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Type           string      `json:"type"`
-		Payload        any `json:"payload"`
-		Priority       int         `json:"priority,omitempty"`
-		IdempotencyKey string      `json:"idempotency_key,omitempty"`
-		MaxAttempts    int         `json:"max_attempts,omitempty"`
+		Type           string `json:"type"`
+		Payload        any    `json:"payload"`
+		Priority       int    `json:"priority,omitempty"`
+		IdempotencyKey string `json:"idempotency_key,omitempty"`
+		MaxAttempts    int    `json:"max_attempts,omitempty"`
+		RunAfter       string `json:"run_after,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
@@ -48,6 +50,14 @@ func (h *Handler) SubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 	if req.MaxAttempts > 0 {
 		builder.WithMaxAttempts(req.MaxAttempts)
 	}
+	if req.RunAfter != "" {
+		t, err := time.Parse(time.RFC3339, req.RunAfter)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "run_after must be RFC3339 format")
+			return
+		}
+		builder.RunAfter(t)
+	}
 
 	runID, err := builder.Execute(r.Context())
 	if err != nil {
@@ -65,8 +75,9 @@ func (h *Handler) SubmitWorkflow(w http.ResponseWriter, r *http.Request) {
 // ListWorkflows handles GET /api/v1/workflows
 func (h *Handler) ListWorkflows(w http.ResponseWriter, r *http.Request) {
 	opts := simpleworkflow.ListOptions{
-		Type:   r.URL.Query().Get("type"),
-		Status: r.URL.Query().Get("status"),
+		Type:           r.URL.Query().Get("type"),
+		Status:         r.URL.Query().Get("status"),
+		IdempotencyKey: r.URL.Query().Get("idempotency_key"),
 	}
 	if v := r.URL.Query().Get("limit"); v != "" {
 		opts.Limit, _ = strconv.Atoi(v)
