@@ -188,6 +188,11 @@ func (r *RunRepository) Create(ctx context.Context, intent Intent) (string, erro
 	if runAfter.IsZero() {
 		runAfter = time.Now()
 	}
+	// Format as UTC string matching SQLite's datetime() format.
+	// Go's time.Time serializes as "2006-01-02 15:04:05.999 +0000 UTC" which
+	// breaks SQLite's string-based datetime comparisons against datetime('now')
+	// which returns "2006-01-02 15:04:05".
+	runAfterStr := runAfter.UTC().Format("2006-01-02 15:04:05")
 	maxAttempts := intent.MaxAttempts
 	if maxAttempts == 0 {
 		maxAttempts = 3
@@ -204,7 +209,7 @@ func (r *RunRepository) Create(ctx context.Context, intent Intent) (string, erro
 
 	var returnedID string
 	err = r.queryer().QueryRowContext(ctx, query,
-		runID, intent.Type, payloadJSON, priority, runAfter,
+		runID, intent.Type, payloadJSON, priority, runAfterStr,
 		sql.NullString{String: intent.IdempotencyKey, Valid: intent.IdempotencyKey != ""},
 		maxAttempts,
 	).Scan(&returnedID)
