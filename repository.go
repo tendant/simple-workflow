@@ -75,6 +75,8 @@ func (h *dbHelper) logEvent(ctx context.Context, workflowID, eventType string, d
 }
 
 // parseTimestamp parses a timestamp string from either PostgreSQL or SQLite format.
+// The modernc.org/sqlite driver stores time.Time in Go's default format which varies
+// by timezone (e.g. "2006-01-02 15:04:05.999999 -0700 MST"), so we handle those too.
 func parseTimestamp(s string) (time.Time, error) {
 	formats := []string{
 		time.RFC3339Nano,
@@ -84,6 +86,9 @@ func parseTimestamp(s string) (time.Time, error) {
 		"2006-01-02 15:04:05 +0000 UTC",
 		"2006-01-02 15:04:05-07:00",
 		"2006-01-02 15:04:05+00",
+		"2006-01-02 15:04:05.999999999 -0700 MST", // Go default format with fractional seconds and named tz
+		"2006-01-02 15:04:05 -0700 MST",            // Go default format without fractional seconds
+		"2006-01-02 15:04:05.999999999 +0000 UTC",  // Go default format with fractional seconds, UTC
 	}
 	for _, f := range formats {
 		if t, err := time.Parse(f, s); err == nil {
@@ -588,7 +593,8 @@ func (r *ScheduleRepository) Create(ctx context.Context, workflowType, cronExpr,
 	}
 
 	now := time.Now().In(loc)
-	nextRun := sched.Next(now)
+	// Format as UTC string matching SQLite's datetime() format for consistent comparisons.
+	nextRunStr := sched.Next(now).UTC().Format("2006-01-02 15:04:05")
 
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
@@ -607,7 +613,7 @@ func (r *ScheduleRepository) Create(ctx context.Context, workflowType, cronExpr,
 
 	var returnedID string
 	err = r.queryer().QueryRowContext(ctx, query,
-		id, workflowType, payloadJSON, cronExpr, timezone, nextRun,
+		id, workflowType, payloadJSON, cronExpr, timezone, nextRunStr,
 		priority, maxAttempts,
 	).Scan(&returnedID)
 	if err != nil {
@@ -728,14 +734,16 @@ func (r *ScheduleRepository) ClaimDue(ctx context.Context) ([]DueSchedule, error
 }
 
 // AdvanceNextRun updates a schedule's next run time and last run time.
+// nextRun is formatted as a UTC string to match SQLite's datetime('now') format.
 func (r *ScheduleRepository) AdvanceNextRun(ctx context.Context, scheduleID string, nextRun time.Time) error {
+	nextRunStr := nextRun.UTC().Format("2006-01-02 15:04:05")
 	now := r.dialect.Now()
 	updateQuery := r.rewrite(fmt.Sprintf(`
 		UPDATE workflow_schedule
 		SET next_run_at = $1, last_run_at = %s, updated_at = %s
 		WHERE id = $2
 	`, now, now))
-	_, err := r.queryer().ExecContext(ctx, updateQuery, nextRun, scheduleID)
+	_, err := r.queryer().ExecContext(ctx, updateQuery, nextRunStr, scheduleID)
 	if err != nil {
 		return fmt.Errorf("failed to update schedule %s: %w", scheduleID, err)
 	}

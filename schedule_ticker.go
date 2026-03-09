@@ -165,7 +165,7 @@ func (t *ScheduleTicker) Tick(ctx context.Context) error {
 		}
 
 		goNow := time.Now().In(loc)
-		nextRun := sched.Next(goNow)
+		nextRun := sched.Next(goNow).UTC() // Store in UTC for consistent SQLite datetime() comparisons
 
 		// Update schedule with next run time
 		if err := schedTx.AdvanceNextRun(ctx, s.ID, nextRun); err != nil {
