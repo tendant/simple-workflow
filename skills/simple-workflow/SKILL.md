@@ -1,3 +1,8 @@
+---
+name: simple-workflow
+description: Manage workflows and schedules via the simple-workflow REST API
+---
+
 # simple-workflow
 
 Manage workflows via the simple-workflow REST API.
