@@ -298,6 +298,26 @@ err := client.Cancel(ctx, runID)
 
 `workflow_event` stores an audit trail of all lifecycle events (created, leased, succeeded, failed, etc.). `workflow_registry` tracks registered workflow types and their runtime.
 
+## Claude Code Skill
+
+This repo includes a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill that lets you manage workflows and schedules via `/simple-workflow` slash commands.
+
+### Install
+
+```bash
+make install-skill
+```
+
+This installs the skill globally to `~/.claude/skills/simple-workflow/` (and `~/.agents/skills/simple-workflow/` for Codex). No additional configuration is needed — skills are discovered automatically.
+
+### Uninstall
+
+```bash
+make uninstall-skill
+```
+
+Once installed, type `/simple-workflow` in Claude Code to use it.
+
 ## License
 
 MIT
